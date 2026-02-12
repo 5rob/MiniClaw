@@ -6,6 +6,7 @@ import { pathToFileURL } from 'url';
 import * as memory from './memory.js';
 import * as calendar from './calendar.js';
 import * as skillBuilder from './skill-builder.js';
+import { setModel, getModel } from './claude.js';
 
 const SKILLS_DIR = path.resolve('skills');
 let config = null;
@@ -223,7 +224,7 @@ async function executeBuiltIn(name, input) {
 
     case 'model_switcher': {
       const MODEL_MAP = {
-        'opus': 'claude-opus-4-5-20250929',
+        'opus': 'claude-opus-4-6',
         'sonnet': 'claude-sonnet-4-5-20250929',
         'haiku': 'claude-haiku-4-5-20251001'
       };

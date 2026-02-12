@@ -122,7 +122,7 @@ export function startDiscord() {
 **Available Models:**
 • \`claude-sonnet-4-5-20250929\` — Sonnet 4.5 (balanced, default)
 • \`claude-haiku-4-5-20251001\` — Haiku 4.5 (fast & cheap)
-• \`claude-opus-4-5-20250929\` — Opus 4.5 (most capable)
+• \`claude-opus-4-6\` — Opus 4.6 (most capable)
 
 Just chat normally for AI assistance!`;
 
