@@ -6,6 +6,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "watch": "node watchdog.js",
     "auth": "node auth-server.js"
   },
   "keywords": ["ai", "assistant", "discord", "claude", "anthropic"],

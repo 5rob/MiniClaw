@@ -26,16 +26,16 @@ function isWithinProject(resolvedPath) {
 
 // Check if a path is protected (live instance files)
 function isProtected(relativePath) {
-  const normalized = relativePath.replace(/\\/g, '/').replace(/^\.\//,  '');
-  return PROTECTED_PREFIXES.some(prefix => 
+  const normalized = relativePath.replace(/\\/g, '/').replace(/^\.\//, '');
+  return PROTECTED_PREFIXES.some(prefix =>
     normalized === prefix || normalized.startsWith(prefix + '/')
   );
 }
 
 // Check if a path is blocked from reading
 function isBlocked(relativePath) {
-  const normalized = relativePath.replace(/\\/g, '/').replace(/^\.\//,  '');
-  return BLOCKED_PATHS.some(blocked => 
+  const normalized = relativePath.replace(/\\/g, '/').replace(/^\.\//, '');
+  return BLOCKED_PATHS.some(blocked =>
     normalized === blocked || normalized.endsWith('/' + blocked)
   );
 }
@@ -82,13 +82,11 @@ export const toolDefinition = {
   }
 };
 
-export async function execute(action, params) {
-  // Handle both direct params and nested params from skill_execute
-  const op = action || params?.action;
-  const targetPath = params?.path;
-  const content = params?.content;
-  const destination = params?.destination;
-  const recursive = params?.recursive || false;
+// FIX: tools.js calls custom handlers as execute(input) with a single object argument.
+// The old version had execute(action, params) which meant the entire input object
+// landed in `action` and `params` was undefined, breaking everything.
+export async function execute(input) {
+  const { action, path: targetPath, content, destination, recursive = false } = input;
 
   if (!targetPath) {
     return { success: false, error: 'Missing required parameter: path' };
@@ -97,7 +95,7 @@ export async function execute(action, params) {
   try {
     const { resolved, relative } = resolvePath(targetPath);
 
-    switch (op) {
+    switch (action) {
       case 'read': {
         if (isBlocked(relative)) {
           return { success: false, error: `Access denied: ${relative} is blocked for security` };
@@ -132,7 +130,7 @@ export async function execute(action, params) {
           return { success: false, error: 'Missing required parameter: destination' };
         }
         const dest = resolvePath(destination);
-        
+
         // Check if destination is protected
         if (isProtected(dest.relative)) {
           return { success: false, error: `Access denied: cannot copy to ${dest.relative}. Live files are protected.` };
@@ -215,7 +213,7 @@ export async function execute(action, params) {
       }
 
       default:
-        return { success: false, error: `Unknown action: ${op}` };
+        return { success: false, error: `Unknown action: ${action}` };
     }
   } catch (err) {
     return { success: false, error: err.message };
