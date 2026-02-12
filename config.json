@@ -1,0 +1,35 @@
+{
+  "personality": {
+    "soulFile": "SOUL.md",
+    "identityFile": "IDENTITY.md"
+  },
+  "model": {
+    "primary": "claude-sonnet-4-5-20250929",
+    "fallback": "claude-haiku-4-5-20251001",
+    "maxTokens": 4096,
+    "contextWindow": 200000
+  },
+  "memory": {
+    "maxDailyLogSizeMB": 5,
+    "loadDaysBack": 2,
+    "searchMaxResults": 10,
+    "embedding": {
+      "provider": "voyage",
+      "model": "voyage-3-lite",
+      "dimensions": 512,
+      "chunkSize": 400,
+      "chunkOverlap": 80
+    }
+  },
+  "compaction": {
+    "enabled": true,
+    "maxHistoryTokens": 160000,
+    "reserveTokensFloor": 20000,
+    "memoryFlush": {
+      "enabled": true,
+      "softThresholdTokens": 4000,
+      "systemPrompt": "Session nearing compaction. Store any durable memories now.",
+      "prompt": "Write any important notes from this conversation to memory. If nothing to store, reply with NO_REPLY."
+    }
+  }
+}

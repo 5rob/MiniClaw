@@ -1,0 +1,28 @@
+# Environment and secrets
+.env
+google-tokens.json
+
+# Dependencies
+node_modules/
+
+# Memory and data (contains personal information)
+memory/
+data/
+
+# Skill data (may contain personal information)
+skills/*/data/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
