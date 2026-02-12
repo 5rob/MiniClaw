@@ -217,8 +217,13 @@ export async function chat(channelId, userMessage) {
 export function setModel(modelId) {
   const cfg = loadConfig();
   cfg.model.primary = modelId;
-  fs.writeFileSync('config.json', JSON.stringify(cfg, null, 2));
-  config = cfg; // Update cache
+  config = cfg; // Update in-memory cache (takes effect immediately)
+  // Also persist to disk so it survives restarts
+  try {
+    fs.writeFileSync('config.json', JSON.stringify(cfg, null, 2));
+  } catch (err) {
+    console.warn('[Claude] Could not persist model change to disk:', err.message);
+  }
   return `Model changed to: ${modelId}`;
 }
 

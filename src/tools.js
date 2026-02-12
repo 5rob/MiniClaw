@@ -128,6 +128,26 @@ const builtInTools = [
       required: ["skillName"]
     }
   },
+  {
+    name: 'model_switcher',
+    description: 'Switch between Claude models at runtime. Use "current" to check, "list" to see options, "switch" to change.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['current', 'switch', 'list'],
+          description: 'Action: current (check model), switch (change model), list (show available)'
+        },
+        modelName: {
+          type: 'string',
+          enum: ['opus', 'sonnet', 'haiku'],
+          description: 'Model shorthand to switch to (only for switch action)'
+        }
+      },
+      required: ['action']
+    }
+  },
   // Skill builder is a built-in tool (core feature)
   skillBuilder.toolDefinition
 ];
@@ -199,6 +219,33 @@ async function executeBuiltIn(name, input) {
       } catch (err) {
         return { success: false, error: err.message };
       }
+    }
+
+    case 'model_switcher': {
+      const MODEL_MAP = {
+        'opus': 'claude-opus-4-5-20250929',
+        'sonnet': 'claude-sonnet-4-5-20250929',
+        'haiku': 'claude-haiku-4-5-20251001'
+      };
+
+      if (input.action === 'current') {
+        return { currentModel: getModel() };
+      }
+
+      if (input.action === 'list') {
+        return { availableModels: MODEL_MAP };
+      }
+
+      if (input.action === 'switch') {
+        if (!input.modelName || !MODEL_MAP[input.modelName]) {
+          return { error: 'Invalid model. Use: opus, sonnet, or haiku' };
+        }
+        const fullModelId = MODEL_MAP[input.modelName];
+        const result = setModel(fullModelId);
+        return { success: true, message: result, newModel: fullModelId };
+      }
+
+      return { error: 'Unknown action' };
     }
 
     default:

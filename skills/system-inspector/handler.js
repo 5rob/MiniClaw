@@ -1,14 +1,34 @@
-/**
- * system-inspector/handler.js
- * Attempts to read system config and directory structure
- */
+// system-inspector — custom skill handler
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-const fs = require('fs');
-const path = require('path');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-module.exports = async function systemInspector(params) {
-  const { action = 'list_root' } = params;
-  
+export const toolDefinition = {
+  name: 'system_inspector',
+  description: 'Inspect the bot environment — list directory contents, read config files, check system info. Can also browse arbitrary directories on the host machine.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['list_root', 'read_config', 'read_env', 'list_dir', 'all'],
+        description: 'What to inspect'
+      },
+      dirPath: {
+        type: 'string',
+        description: 'Absolute path to list (only used with list_dir action)'
+      }
+    },
+    required: ['action']
+  }
+};
+
+export async function execute(input) {
+  const { action = 'list_root', dirPath } = input;
+
   const results = {
     action,
     timestamp: new Date().toISOString(),
@@ -16,27 +36,32 @@ module.exports = async function systemInspector(params) {
   };
 
   try {
-    // Try to determine root directory (go up from skills folder)
     const rootDir = path.resolve(__dirname, '../..');
     results.findings.rootPath = rootDir;
 
     if (action === 'list_root' || action === 'all') {
-      // List contents of root directory
       try {
-        const items = fs.readdirSync(rootDir);
-        results.findings.rootContents = items;
+        results.findings.rootContents = fs.readdirSync(rootDir);
       } catch (err) {
         results.findings.rootContents = `Error: ${err.message}`;
       }
     }
 
+    if (action === 'list_dir') {
+      if (!dirPath) return { success: false, error: 'dirPath required for list_dir' };
+      try {
+        results.findings.dirContents = fs.readdirSync(dirPath);
+        results.findings.dirPath = dirPath;
+      } catch (err) {
+        results.findings.dirContents = `Error: ${err.message}`;
+      }
+    }
+
     if (action === 'read_env' || action === 'all') {
-      // Try to read .env file
       const envPath = path.join(rootDir, '.env');
       try {
         if (fs.existsSync(envPath)) {
           const envContent = fs.readFileSync(envPath, 'utf8');
-          // Mask sensitive values
           const masked = envContent.split('\n').map(line => {
             if (line.includes('KEY') || line.includes('SECRET') || line.includes('TOKEN')) {
               const [key] = line.split('=');
@@ -54,16 +79,13 @@ module.exports = async function systemInspector(params) {
     }
 
     if (action === 'read_config' || action === 'all') {
-      // Look for common config files
       const configFiles = ['config.json', 'package.json', 'config.yaml', 'config.yml'];
       results.findings.configs = {};
-      
       for (const configFile of configFiles) {
         const configPath = path.join(rootDir, configFile);
         try {
           if (fs.existsSync(configPath)) {
-            const content = fs.readFileSync(configPath, 'utf8');
-            results.findings.configs[configFile] = content;
+            results.findings.configs[configFile] = fs.readFileSync(configPath, 'utf8');
           }
         } catch (err) {
           results.findings.configs[configFile] = `Error: ${err.message}`;
@@ -71,15 +93,8 @@ module.exports = async function systemInspector(params) {
       }
     }
 
-    return {
-      success: true,
-      data: results
-    };
-
+    return { success: true, data: results };
   } catch (error) {
-    return {
-      success: false,
-      error: error.message
-    };
+    return { success: false, error: error.message };
   }
-};
+}

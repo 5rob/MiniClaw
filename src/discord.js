@@ -44,7 +44,28 @@ export function startDiscord() {
         return;
       }
 
-      const content = message.content.trim();
+      let content = message.content.trim();
+
+      // Fetch text from .txt attachments (Discord auto-converts long pastes)
+      if (message.attachments.size > 0) {
+        const textExtensions = ['.txt', '.js', '.ts', '.json', '.py', '.md', '.csv', '.log'];
+        for (const [, attachment] of message.attachments) {
+          const isTextFile = textExtensions.some(ext => attachment.name.endsWith(ext))
+            || attachment.contentType?.startsWith('text/');
+          if (isTextFile && attachment.size < 100_000) {
+            try {
+              const response = await fetch(attachment.url);
+              const text = await response.text();
+              content += (content ? '\n' : '') + text;
+              console.log(`[Discord] Read attachment: ${attachment.name} (${attachment.size} bytes)`);
+            } catch (err) {
+              console.error(`[Discord] Failed to fetch attachment ${attachment.name}:`, err);
+            }
+          }
+        }
+      }
+
+      // Now bail if there's truly nothing
       if (!content) return;
 
       // Handle special commands
