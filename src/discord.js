@@ -136,6 +136,11 @@ Just chat normally for AI assistance!`;
       // Get response from Claude
       const response = await chat(message.channel.id, content);
 
+      if (!response || response.trim().length === 0) {
+        await message.reply("✅ *(done — tools executed, no text response)*");
+        return;
+      }
+
       // Discord has a 2000 char limit — split long messages
       if (response.length <= 2000) {
         await message.reply(response);
