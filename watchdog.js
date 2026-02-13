@@ -89,6 +89,7 @@ function startBot() {
   });
 
   // Pipe bot output to both console AND log file
+  const thisPid = botProcess.pid;
   botProcess.stdout.on('data', (data) => {
     const text = data.toString();
     process.stdout.write(text); // Still show in terminal
@@ -121,6 +122,12 @@ function startBot() {
   });
 
   botProcess.on('exit', (code, signal) => {
+    // Guard: if this process isn't the current one, ignore the late exit event
+    if (botProcess && botProcess.pid !== thisPid) {
+      log(`Ignoring late exit event from old process (PID: ${thisPid})`);
+      return;
+    }
+
     log(`Bot exited (code: ${code}, signal: ${signal})`);
     botProcess = null;
 
@@ -147,12 +154,13 @@ function stopBot() {
     }
 
     isRestarting = true;
+    let resolved = false;
+    const done = () => { if (!resolved) { resolved = true; resolve(); } };
+
     const pid = botProcess.pid;
     log(`Stopping bot (PID: ${pid})...`);
 
-    botProcess.on('exit', () => {
-      resolve();
-    });
+    botProcess.on('exit', done);
 
     // Windows needs taskkill for process tree
     if (process.platform === 'win32') {
@@ -161,13 +169,13 @@ function stopBot() {
       botProcess.kill('SIGTERM');
     }
 
-    // Force kill after 5 seconds
+    // Force kill after 5 seconds (safety net)
     setTimeout(() => {
       if (botProcess && !botProcess.killed) {
         log('Force killing bot...');
         botProcess.kill('SIGKILL');
       }
-      resolve();
+      done();
     }, 5000);
   });
 }

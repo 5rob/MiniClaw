@@ -8,14 +8,21 @@
     "start": "node src/index.js",
     "auth": "node auth-server.js"
   },
-  "keywords": ["ai", "assistant", "discord", "claude", "anthropic"],
+  "keywords": [
+    "ai",
+    "assistant",
+    "discord",
+    "claude",
+    "anthropic"
+  ],
   "author": "Rob",
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.0",
+    "@google/genai": "^1.41.0",
+    "better-sqlite3": "^11.7.0",
     "discord.js": "^14.17.0",
-    "googleapis": "^144.0.0",
     "dotenv": "^16.4.7",
-    "better-sqlite3": "^11.7.0"
+    "googleapis": "^144.0.0"
   }
 }

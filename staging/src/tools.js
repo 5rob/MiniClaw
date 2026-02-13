@@ -1,5 +1,6 @@
 // src/tools.js
 // Tool registry — loads built-in tools + custom skills
+// v2.0: Added generate_image tool (Gemini image generation)
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
@@ -7,6 +8,7 @@ import * as memory from './memory.js';
 import * as calendar from './calendar.js';
 import * as skillBuilder from './skill-builder.js';
 import { setModel, getModel } from './claude.js';
+import { generateImage, cleanupTempFiles, isGeminiEnabled } from './gemini.js';
 
 const SKILLS_DIR = path.resolve('skills');
 let config = null;
@@ -149,6 +151,25 @@ const builtInTools = [
       required: ['action']
     }
   },
+  {
+    name: 'generate_image',
+    description: 'Generate an image using Gemini AI. Returns a file path that will be automatically attached to the Discord response. Use this when the user asks you to create, draw, generate, or make an image/picture/illustration.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: {
+          type: 'string',
+          description: 'Detailed description of the image to generate. Be specific about style, content, colors, composition.'
+        },
+        aspectRatio: {
+          type: 'string',
+          enum: ['1:1', '16:9', '9:16', '4:3', '3:4'],
+          description: 'Aspect ratio (default: 1:1). Use 16:9 for landscapes, 9:16 for portraits, etc.'
+        }
+      },
+      required: ['prompt']
+    }
+  },
   // Skill builder is a built-in tool (core feature)
   skillBuilder.toolDefinition
 ];
@@ -247,6 +268,18 @@ async function executeBuiltIn(name, input) {
       }
 
       return { error: 'Unknown action' };
+    }
+
+    case 'generate_image': {
+      if (!isGeminiEnabled()) {
+        return { error: 'Image generation unavailable — no GEMINI_API_KEY configured.' };
+      }
+      const result = await generateImage(input.prompt, input.aspectRatio || '1:1');
+      
+      // Schedule cleanup of old temp files (non-blocking)
+      setTimeout(() => cleanupTempFiles(), 5000);
+      
+      return result;
     }
 
     default:
