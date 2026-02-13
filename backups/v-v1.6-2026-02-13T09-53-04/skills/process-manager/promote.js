@@ -1,5 +1,5 @@
 // promote.js — Auto-promotion from staging to live
-// Part of process-manager v1.5, updated v1.8 (upgrade context)
+// Part of process-manager v1.5
 import fs from 'fs';
 import path from 'path';
 
@@ -7,7 +7,6 @@ const PROJECT_ROOT = process.cwd();
 const STAGING_DIR = path.join(PROJECT_ROOT, 'staging');
 const BACKUPS_DIR = path.join(PROJECT_ROOT, 'backups');
 const RESTART_SIGNAL = path.join(PROJECT_ROOT, '.restart-signal');
-const UPGRADE_CONTEXT = path.join(PROJECT_ROOT, '.upgrade-context');
 
 // Files/folders to promote from staging to live
 const PROMOTE_PATHS = ['src', 'skills'];
@@ -127,21 +126,7 @@ export function promote(input = {}) {
     };
   }
 
-  // Step 3: Write upgrade context file (for context-aware wake-up message)
-  try {
-    const upgradeContext = {
-      version,
-      promoted,
-      timestamp: new Date().toISOString(),
-      backupDir
-    };
-    fs.writeFileSync(UPGRADE_CONTEXT, JSON.stringify(upgradeContext, null, 2));
-  } catch (err) {
-    // Non-fatal — wake-up just won't have upgrade context
-    console.error('[Promote] Failed to write upgrade context:', err.message);
-  }
-
-  // Step 4: Signal restart (unless skipped)
+  // Step 3: Signal restart (unless skipped)
   let restartResult = null;
   if (!skipRestart) {
     try {

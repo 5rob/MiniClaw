@@ -1,6 +1,6 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
-// v1.7 — Task acknowledgement messages (Haiku-generated quick ack before long operations)
+// v1.6 — Auto model switching based on conversation context
 import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
@@ -92,27 +92,17 @@ function autoSwitchModel(messageContent) {
   return label;
 }
 
-// --- Haiku Quick-Call Helper (shared by wake-up and ack) ---
-const haiku = new Anthropic(); // Uses ANTHROPIC_API_KEY from env
-
-async function haikuQuickCall(system, userContent, maxTokens = 100) {
-  const response = await haiku.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: maxTokens,
-    system,
-    messages: [{ role: 'user', content: userContent }]
-  });
-  return response.content[0]?.text?.trim() || null;
-}
-
 /**
  * Generate a short, personality-filled wake-up message using a quick Haiku call.
  * Keeps it cheap and fast — this isn't a full conversation, just flavour.
  */
 async function generateWakeUpMessage() {
   try {
-    const text = await haikuQuickCall(
-      `You are an AI assistant who just came back online after a restart. Generate a single short wake-up message (1-2 sentences max). Be witty, dry, and casual — not corporate or overly enthusiastic. You have personality: think dry humour, understated competence, maybe a little self-aware about being rebooted.
+    const anthropic = new Anthropic(); // Uses ANTHROPIC_API_KEY from env
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 100,
+      system: `You are an AI assistant who just came back online after a restart. Generate a single short wake-up message (1-2 sentences max). Be witty, dry, and casual — not corporate or overly enthusiastic. You have personality: think dry humour, understated competence, maybe a little self-aware about being rebooted.
 
 Examples of the vibe (don't repeat these exactly, come up with something fresh):
 - "Back online. What'd I miss?"
@@ -122,42 +112,14 @@ Examples of the vibe (don't repeat these exactly, come up with something fresh):
 - "Back. Did you try turning me off and on again? ...oh wait."
 
 Just output the message, nothing else. No quotes, no preamble.`,
-      'Generate a wake-up message.'
-    );
+      messages: [{ role: 'user', content: 'Generate a wake-up message.' }]
+    });
+
+    const text = response.content[0]?.text?.trim();
     return text || "I'm back.";
   } catch (err) {
     console.error('[Discord] Failed to generate wake-up message:', err.message);
     return "I'm back online."; // Fallback if API call fails
-  }
-}
-
-/**
- * Generate a quick acknowledgement message before a long operation.
- * Haiku decides if the message is a task (needs ack) or casual chat (no ack).
- * Returns the ack string, or null if no ack is needed.
- */
-async function generateAckMessage(userMessage) {
-  try {
-    const text = await haikuQuickCall(
-      `You are an AI assistant's quick-response module. Your job: decide if the user's message is a task/request that will take time to process, or just casual conversation.
-
-If it IS a task or request (building something, searching for info, reading files, making changes, creating events, etc.):
-→ Respond with a brief, casual acknowledgement (1 short sentence max). Be natural and conversational, not corporate. Vary your responses. Can reference what they asked for.
-Examples: "On it.", "Give me a sec.", "Sure thing, working on it.", "Checking now.", "Building that now, one sec.", "Let me take a look.", "Pulling that up."
-
-If it is NOT a task (greetings, casual chat, questions that need discussion, opinions, short replies like "yes", "no", "thanks", "nice", feedback on something you just did):
-→ Respond with exactly: SKIP
-
-Just output the ack message or SKIP, nothing else. No quotes, no preamble.`,
-      userMessage,
-      60
-    );
-
-    if (!text || text === 'SKIP') return null;
-    return text;
-  } catch (err) {
-    console.error('[Discord] Failed to generate ack message:', err.message);
-    return null; // Fail silently — ack is optional
   }
 }
 
@@ -314,24 +276,8 @@ Just chat normally for AI assistance!`;
         switchNotice = `⚡ *Auto-switched to ${switchResult}*\n\n`;
       }
 
-      // --- Task Acknowledgement (v1.7) ---
-      // Fire off a quick Haiku call to generate an ack message.
-      // Runs in parallel with typing indicator — doesn't block the main flow.
-      // If Haiku decides it's casual chat, returns null and we skip the ack.
-      const ackPromise = generateAckMessage(content);
-
       // Send typing indicator
       await message.channel.sendTyping();
-
-      // Await the ack result (Haiku is fast — typically <1s)
-      const ackMessage = await ackPromise;
-      if (ackMessage) {
-        // Send as a regular message (not a reply) so the real response can reply to Rob's original
-        const ackText = switchNotice ? switchNotice + ackMessage : ackMessage;
-        await message.channel.send(ackText);
-        switchNotice = ''; // Don't double-up the switch notice on the main response
-        console.log(`[Discord] Ack sent: "${ackMessage}"`);
-      }
 
       // Get response from Claude
       const response = await chat(message.channel.id, content);

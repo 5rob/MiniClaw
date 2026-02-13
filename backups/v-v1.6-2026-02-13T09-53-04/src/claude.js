@@ -56,16 +56,10 @@ function buildSystemPrompt() {
     ? recentLogs.map(l => `### ${l.date}\n${l.content}`).join('\n')
     : '(No recent daily logs)';
 
-  // Check if this is the staging/test instance
-  const botRole = process.env.BOT_ROLE || 'live';
-  const stagingNotice = botRole === 'staging'
-    ? `\n\n## ⚠️ Staging Instance Notice\nYou are **Tester Bud**, the staging/test instance. You exist for testing new features in the #staging channel. You share memory with the live bot but you are NOT the live bot. When greeted, identify yourself as Tester Bud. Do not claim to be the main/live instance. Your purpose is to test experimental changes safely before they go live.\n`
-    : '';
-
   return `${soul || '(No SOUL.md found — create one to define your personality)'}
 
 ${identity ? `## Identity\n${identity}` : ''}
-${stagingNotice}
+
 Current date/time: ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney' })}
 
 ## Your Long-Term Memory

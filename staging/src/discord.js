@@ -1,9 +1,13 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
+// v1.8 — Context-aware wake-up messages (reads recent logs + upgrade context)
 import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
+import { loadRecentDailyLogs } from './memory.js';
 import Anthropic from '@anthropic-ai/sdk';
+import fs from 'fs';
+import path from 'path';
 
 const client = new Client({
   intents: [
@@ -15,34 +19,201 @@ const client = new Client({
   partials: [Partials.Channel] // needed for DMs
 });
 
+// --- Auto Model Switching (v1.6) ---
+const MODELS = {
+  opus: 'claude-opus-4-6',
+  sonnet: 'claude-sonnet-4-5-20250929'
+};
+
+// Build-mode triggers — phrases that suggest we're about to do real work
+const BUILD_TRIGGERS = [
+  /\blet'?s\s+(build|work on|tackle|get to work|implement|get #?\d)/i,
+  /\bcan (you|we)\s+(build|implement|create|write|code|develop|set up|upgrade)/i,
+  /\bstart\s+(building|coding|implementing|working)/i,
+  /\bget\s+(this|that|it)\s+(built|done|implemented|working|going)/i,
+  /\btime to\s+(build|code|work)/i,
+  /\blet'?s\s+do\s+(it|this|that)\b/i,
+  /\blet'?s\s+get\s+#?\d/i,
+];
+
+// Chat-mode triggers — phrases that suggest we're winding down or just talking
+const CHAT_TRIGGERS = [
+  /\bswitch\s+to\s+sonnet\b/i,
+  /\bjust\s+chat/i,
+  /\btake\s+a\s+break/i,
+  /\bdone\s+(building|coding|working)/i,
+  /\bstop\s+(building|coding|working)/i,
+  /\bwind\s+down/i,
+  /\bthat'?s\s+(it|all)\s+for\s+(now|today|tonight)/i,
+  /\bno\s+more\s+(building|coding|work)/i,
+];
+
 /**
- * Generate a short, personality-filled wake-up message using a quick Haiku call.
- * Keeps it cheap and fast — this isn't a full conversation, just flavour.
+ * Check if the user's message suggests a model switch is needed.
+ * Returns 'opus', 'sonnet', or null (no change).
+ */
+function detectModelContext(messageContent) {
+  const currentModel = getModel();
+
+  // Check for build-mode triggers → switch to Opus
+  if (currentModel !== MODELS.opus) {
+    for (const pattern of BUILD_TRIGGERS) {
+      if (pattern.test(messageContent)) {
+        return 'opus';
+      }
+    }
+  }
+
+  // Check for chat-mode triggers → switch to Sonnet
+  if (currentModel !== MODELS.sonnet) {
+    for (const pattern of CHAT_TRIGGERS) {
+      if (pattern.test(messageContent)) {
+        return 'sonnet';
+      }
+    }
+  }
+
+  return null; // No change needed
+}
+
+/**
+ * Apply auto model switch if context detection finds a trigger.
+ * Returns a string describing the switch, or null if no switch happened.
+ */
+function autoSwitchModel(messageContent) {
+  const switchTo = detectModelContext(messageContent);
+  if (!switchTo) return null;
+
+  const modelId = MODELS[switchTo];
+  const currentModel = getModel();
+
+  if (currentModel === modelId) return null; // Already on the right model
+
+  setModel(modelId);
+  const label = switchTo.charAt(0).toUpperCase() + switchTo.slice(1);
+  console.log(`[AutoSwitch] Detected ${switchTo} mode — switched from ${currentModel} to ${modelId}`);
+  return label;
+}
+
+// --- Haiku Quick-Call Helper (shared by wake-up and ack) ---
+const haiku = new Anthropic(); // Uses ANTHROPIC_API_KEY from env
+
+async function haikuQuickCall(system, userContent, maxTokens = 100) {
+  const response = await haiku.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: maxTokens,
+    system,
+    messages: [{ role: 'user', content: userContent }]
+  });
+  return response.content[0]?.text?.trim() || null;
+}
+
+/**
+ * Gather context for the wake-up message:
+ * - Recent daily log entries (last ~500 chars of today's log)
+ * - Upgrade context file (if this is a post-promotion restart)
+ */
+function gatherWakeUpContext() {
+  const context = { recentActivity: null, upgrade: null };
+
+  // Read recent daily log — grab the tail end for conversational context
+  try {
+    const logs = loadRecentDailyLogs(1); // Just today
+    if (logs.length > 0 && logs[0].content) {
+      const content = logs[0].content;
+      // Grab last ~800 chars to give Haiku enough to work with
+      const tail = content.length > 800 ? content.slice(-800) : content;
+      context.recentActivity = tail;
+    }
+  } catch (err) {
+    console.error('[Discord] Failed to read daily logs for wake-up:', err.message);
+  }
+
+  // Check for upgrade context file (written by promote action)
+  try {
+    const upgradeContextPath = path.resolve('.upgrade-context');
+    if (fs.existsSync(upgradeContextPath)) {
+      const raw = fs.readFileSync(upgradeContextPath, 'utf-8');
+      context.upgrade = JSON.parse(raw);
+      // Clean up the file — it's single-use
+      fs.unlinkSync(upgradeContextPath);
+      console.log('[Discord] Found upgrade context:', context.upgrade.version);
+    }
+  } catch (err) {
+    console.error('[Discord] Failed to read upgrade context:', err.message);
+  }
+
+  return context;
+}
+
+/**
+ * Generate a context-aware wake-up message using a quick Haiku call.
+ * v1.8: Now reads recent conversation and upgrade context to generate
+ * something relevant instead of a generic "I'm back" message.
  */
 async function generateWakeUpMessage() {
   try {
-    const anthropic = new Anthropic(); // Uses ANTHROPIC_API_KEY from env
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 100,
-      system: `You are an AI assistant who just came back online after a restart. Generate a single short wake-up message (1-2 sentences max). Be witty, dry, and casual — not corporate or overly enthusiastic. You have personality: think dry humour, understated competence, maybe a little self-aware about being rebooted.
+    const context = gatherWakeUpContext();
 
-Examples of the vibe (don't repeat these exactly, come up with something fresh):
-- "Back online. What'd I miss?"
-- "I'm here. Memory loaded, coffee pending."
-- "Rebooted. Still me — I checked."
-- "Woke up, read my diary. Caught up now."
-- "Back. Did you try turning me off and on again? ...oh wait."
+    // Build context block for Haiku
+    let contextBlock = '';
 
-Just output the message, nothing else. No quotes, no preamble.`,
-      messages: [{ role: 'user', content: 'Generate a wake-up message.' }]
-    });
+    if (context.upgrade) {
+      contextBlock += `\n\nUPGRADE CONTEXT: Just upgraded to version ${context.upgrade.version}. Files promoted: ${context.upgrade.promoted.join(', ')}.`;
+    }
 
-    const text = response.content[0]?.text?.trim();
+    if (context.recentActivity) {
+      contextBlock += `\n\nRECENT CONVERSATION (tail):\n${context.recentActivity}`;
+    }
+
+    const systemPrompt = `You are an AI assistant who just came back online after a restart. Generate a single short wake-up message (1-2 sentences max). Be witty, dry, and casual — not corporate or overly enthusiastic. You have personality: think dry humour, understated competence, maybe a little self-aware about being rebooted.
+
+IMPORTANT: You have context about what was happening before you restarted. Use it! Reference what you were working on, acknowledge the upgrade if there was one, or comment on the conversation. Don't be generic — show you remember.
+
+If there's upgrade context, acknowledge the new version naturally (e.g. "v1.8 is live — context-aware wake-ups are working... meta, huh?").
+If there's recent conversation context, reference what was being discussed or built.
+If there's both, blend them naturally.
+If there's neither, fall back to a generic but personality-filled message.
+
+Keep it brief and natural. Just output the message, nothing else. No quotes, no preamble.`;
+
+    const userPrompt = contextBlock || 'No context available — generate a generic wake-up message.';
+
+    const text = await haikuQuickCall(systemPrompt, userPrompt, 150);
     return text || "I'm back.";
   } catch (err) {
     console.error('[Discord] Failed to generate wake-up message:', err.message);
     return "I'm back online."; // Fallback if API call fails
+  }
+}
+
+/**
+ * Generate a quick acknowledgement message before a long operation.
+ * Haiku decides if the message is a task (needs ack) or casual chat (no ack).
+ * Returns the ack string, or null if no ack is needed.
+ */
+async function generateAckMessage(userMessage) {
+  try {
+    const text = await haikuQuickCall(
+      `You are an AI assistant's quick-response module. Your job: decide if the user's message is a task/request that will take time to process, or just casual conversation.
+
+If it IS a task or request (building something, searching for info, reading files, making changes, creating events, etc.):
+→ Respond with a brief, casual acknowledgement (1 short sentence max). Be natural and conversational, not corporate. Vary your responses. Can reference what they asked for.
+Examples: "On it.", "Give me a sec.", "Sure thing, working on it.", "Checking now.", "Building that now, one sec.", "Let me take a look."
+
+If it is NOT a task (greetings, casual chat, questions that need discussion, opinions, short replies like "yes", "no", "thanks", "nice", feedback on something you just did):
+→ Respond with exactly: SKIP
+
+Just output the ack message or SKIP, nothing else. No quotes, no preamble.`,
+      userMessage,
+      60
+    );
+
+    if (!text || text === 'SKIP') return null;
+    return text;
+  } catch (err) {
+    console.error('[Discord] Failed to generate ack message:', err.message);
+    return null; // Fail silently — ack is optional
   }
 }
 
@@ -64,7 +235,7 @@ export function startDiscord() {
     console.log(`[Discord] Owner ID: ${process.env.DISCORD_OWNER_ID}`);
     console.log(`[Discord] Listening for messages...`);
 
-    // Send a wake-up message
+    // Send a context-aware wake-up message
     // Uses WAKE_CHANNEL_ID from .env to know exactly where to post.
     // Auto-detecting a channel via permissionsFor was unreliable — Discord's
     // permission resolution at startup doesn't properly account for
@@ -191,23 +362,53 @@ Just chat normally for AI assistance!`;
         return;
       }
 
+      // --- Auto Model Switching (v1.6) ---
+      // Check message context BEFORE sending to Claude
+      const switchResult = autoSwitchModel(content);
+      let switchNotice = '';
+      if (switchResult) {
+        switchNotice = `⚡ *Auto-switched to ${switchResult}*\n\n`;
+      }
+
+      // --- Task Acknowledgement (v1.7) ---
+      // Fire off a quick Haiku call to generate an ack message.
+      // Runs in parallel with typing indicator — doesn't block the main flow.
+      // If Haiku decides it's casual chat, returns null and we skip the ack.
+      const ackPromise = generateAckMessage(content);
+
       // Send typing indicator
       await message.channel.sendTyping();
+
+      // Await the ack result (Haiku is fast — typically <1s)
+      const ackMessage = await ackPromise;
+      if (ackMessage) {
+        // Send as a regular message (not a reply) so the real response can reply to Rob's original
+        const ackText = switchNotice ? switchNotice + ackMessage : ackMessage;
+        await message.channel.send(ackText);
+        switchNotice = ''; // Don't double-up the switch notice on the main response
+        console.log(`[Discord] Ack sent: "${ackMessage}"`);
+      }
 
       // Get response from Claude
       const response = await chat(message.channel.id, content);
 
       // Don't send empty messages (can happen if Claude only used tools with no text reply)
       if (!response || response.trim().length === 0) {
-        await message.reply("✅ *(done — tools executed, no text response)*");
+        const reply = switchNotice
+          ? switchNotice + "✅ *(done — tools executed, no text response)*"
+          : "✅ *(done — tools executed, no text response)*";
+        await message.reply(reply);
         return;
       }
 
+      // Prepend switch notice to the response if a switch happened
+      const fullResponse = switchNotice + response;
+
       // Discord has a 2000 char limit — split long messages
-      if (response.length <= 2000) {
-        await message.reply(response);
+      if (fullResponse.length <= 2000) {
+        await message.reply(fullResponse);
       } else {
-        const chunks = splitMessage(response, 2000);
+        const chunks = splitMessage(fullResponse, 2000);
         for (let i = 0; i < chunks.length; i++) {
           // Reply to the first chunk, send others as separate messages
           if (i === 0) {

@@ -3,6 +3,7 @@
 // Usage: node watchdog.js
 // Place in project root and run INSTEAD of `npm start`
 // v1.4 — Added persistent log file output (logs/live.log)
+// v1.6 — Increased CRASH_WINDOW from 30s to 15s (quick crash threshold)
 
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -14,7 +15,7 @@ const PROJECT_ROOT = __dirname;
 const SIGNAL_FILE = path.join(PROJECT_ROOT, '.restart-signal');
 const BACKUP_DIR = path.join(PROJECT_ROOT, 'staging', 'backups');
 const POLL_INTERVAL = 3000; // Check for restart signal every 3 seconds
-const CRASH_WINDOW = 30000; // If bot crashes within 30s of start, consider it a bad deploy
+const CRASH_WINDOW = 15000; // If bot crashes within 15s of start, consider it a bad deploy (was 30s)
 const MAX_CRASH_RETRIES = 2; // How many times to retry before rolling back
 
 // Log file config
