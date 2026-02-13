@@ -1,6 +1,6 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
-// v1.9 — Heartbeat file for watchdog health checks (decouples "alive" from "wake-up sent")
+// v1.8 — Context-aware wake-up messages (reads recent logs + upgrade context)
 import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
@@ -18,23 +18,6 @@ const client = new Client({
   ],
   partials: [Partials.Channel] // needed for DMs
 });
-
-// --- Heartbeat (v1.9) ---
-// Write a heartbeat file immediately on startup so the watchdog knows we're alive,
-// even if the wake-up message takes a while to generate.
-const HEARTBEAT_FILE = path.resolve('.heartbeat');
-
-function writeHeartbeat() {
-  try {
-    fs.writeFileSync(HEARTBEAT_FILE, JSON.stringify({
-      pid: process.pid,
-      timestamp: Date.now(),
-      time: new Date().toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney' })
-    }));
-  } catch (err) {
-    console.error('[Discord] Failed to write heartbeat:', err.message);
-  }
-}
 
 // --- Auto Model Switching (v1.6) ---
 const MODELS = {
@@ -252,13 +235,11 @@ export function startDiscord() {
     console.log(`[Discord] Owner ID: ${process.env.DISCORD_OWNER_ID}`);
     console.log(`[Discord] Listening for messages...`);
 
-    // v1.9: Write heartbeat IMMEDIATELY — before any async work
-    // This tells the watchdog "I'm alive" even if the wake-up message takes 30+ seconds
-    writeHeartbeat();
-    console.log('[Discord] Heartbeat written');
-
-    // Send a context-aware wake-up message (async — can take a while)
+    // Send a context-aware wake-up message
     // Uses WAKE_CHANNEL_ID from .env to know exactly where to post.
+    // Auto-detecting a channel via permissionsFor was unreliable — Discord's
+    // permission resolution at startup doesn't properly account for
+    // channel-level overrides, causing "Missing Access" errors.
     setTimeout(async () => {
       try {
         const channelId = process.env.WAKE_CHANNEL_ID;

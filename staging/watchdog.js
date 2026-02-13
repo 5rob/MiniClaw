@@ -3,6 +3,8 @@
 // Usage: node watchdog.js
 // Place in project root and run INSTEAD of `npm start`
 // v1.4 — Added persistent log file output (logs/live.log)
+// v1.6 — Increased CRASH_WINDOW from 30s to 15s (quick crash threshold)
+// v1.9 — Heartbeat-based health checks (decouples "alive" from "wake-up message sent")
 
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -12,9 +14,10 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = __dirname;
 const SIGNAL_FILE = path.join(PROJECT_ROOT, '.restart-signal');
+const HEARTBEAT_FILE = path.join(PROJECT_ROOT, '.heartbeat');
 const BACKUP_DIR = path.join(PROJECT_ROOT, 'staging', 'backups');
 const POLL_INTERVAL = 3000; // Check for restart signal every 3 seconds
-const CRASH_WINDOW = 30000; // If bot crashes within 30s of start, consider it a bad deploy
+const CRASH_WINDOW = 15000; // If bot crashes within 15s of start, consider it a bad deploy
 const MAX_CRASH_RETRIES = 2; // How many times to retry before rolling back
 
 // Log file config
@@ -66,6 +69,38 @@ function log(msg) {
   appendToLog(line);
 }
 
+/**
+ * Check if the bot has written a recent heartbeat file.
+ * v1.9: The bot writes .heartbeat immediately on Discord 'ready' event,
+ * BEFORE generating wake-up messages. This lets us distinguish between
+ * "bot is alive but still generating wake-up" and "bot actually crashed."
+ */
+function hasRecentHeartbeat() {
+  try {
+    if (!fs.existsSync(HEARTBEAT_FILE)) return false;
+    const raw = fs.readFileSync(HEARTBEAT_FILE, 'utf-8');
+    const heartbeat = JSON.parse(raw);
+    const age = Date.now() - heartbeat.timestamp;
+    // Consider heartbeat valid if it's from the current boot (within CRASH_WINDOW)
+    return age < CRASH_WINDOW;
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * Clean up the heartbeat file (called before starting a new bot instance).
+ */
+function clearHeartbeat() {
+  try {
+    if (fs.existsSync(HEARTBEAT_FILE)) {
+      fs.unlinkSync(HEARTBEAT_FILE);
+    }
+  } catch (err) {
+    // Non-critical
+  }
+}
+
 function startBot() {
   if (botProcess && !botProcess.killed) {
     log('Bot is already running');
@@ -74,6 +109,9 @@ function startBot() {
 
   log('Starting MiniClaw...');
   lastStartTime = Date.now();
+
+  // Clear any stale heartbeat from previous run
+  clearHeartbeat();
 
   // Ensure log directory exists
   ensureDir(LOG_DIR);
@@ -174,14 +212,22 @@ function stopBot() {
 function handleCrash() {
   const timeSinceStart = Date.now() - (lastStartTime || 0);
 
+  // v1.9: Check heartbeat before counting as a quick crash.
+  // If the bot wrote a heartbeat, it successfully connected to Discord —
+  // it's not a "bad deploy" crash, it's something else (like wake-up message failing).
   if (timeSinceStart < CRASH_WINDOW) {
-    crashCount++;
-    log(`Bot crashed quickly (${Math.round(timeSinceStart / 1000)}s). Crash count: ${crashCount}/${MAX_CRASH_RETRIES}`);
+    if (hasRecentHeartbeat()) {
+      log('Bot crashed within crash window, but heartbeat found — bot was alive. Not counting as bad deploy.');
+      crashCount = 0; // Reset — this isn't a deploy issue
+    } else {
+      crashCount++;
+      log(`Bot crashed quickly (${Math.round(timeSinceStart / 1000)}s) with NO heartbeat. Crash count: ${crashCount}/${MAX_CRASH_RETRIES}`);
 
-    if (crashCount >= MAX_CRASH_RETRIES) {
-      log('Too many quick crashes. Attempting rollback...');
-      attemptRollback();
-      return;
+      if (crashCount >= MAX_CRASH_RETRIES) {
+        log('Too many quick crashes. Attempting rollback...');
+        attemptRollback();
+        return;
+      }
     }
   } else {
     // Crash after running for a while — reset counter and just restart
@@ -274,12 +320,14 @@ function watchForRestartSignal() {
 process.on('SIGINT', async () => {
   log('Watchdog shutting down...');
   await stopBot();
+  clearHeartbeat();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
   log('Watchdog shutting down...');
   await stopBot();
+  clearHeartbeat();
   process.exit(0);
 });
 
@@ -287,6 +335,7 @@ process.on('SIGTERM', async () => {
 log('=== MiniClaw Watchdog Starting ===');
 log(`Project root: ${PROJECT_ROOT}`);
 log(`Signal file: ${SIGNAL_FILE}`);
+log(`Heartbeat file: ${HEARTBEAT_FILE}`);
 log(`Log file: ${LOG_FILE}`);
 log(`Polling every ${POLL_INTERVAL / 1000}s for restart signals`);
 
@@ -295,6 +344,9 @@ if (fs.existsSync(SIGNAL_FILE)) {
   log('Cleaning up stale restart signal...');
   fs.unlinkSync(SIGNAL_FILE);
 }
+
+// Clean up any stale heartbeat
+clearHeartbeat();
 
 startBot();
 watchForRestartSignal();

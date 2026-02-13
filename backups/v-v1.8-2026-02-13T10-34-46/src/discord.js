@@ -1,13 +1,10 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
-// v1.9 — Heartbeat file for watchdog health checks (decouples "alive" from "wake-up sent")
+// v1.7 — Task acknowledgement messages (Haiku-generated quick ack before long operations)
 import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
-import { loadRecentDailyLogs } from './memory.js';
 import Anthropic from '@anthropic-ai/sdk';
-import fs from 'fs';
-import path from 'path';
 
 const client = new Client({
   intents: [
@@ -18,23 +15,6 @@ const client = new Client({
   ],
   partials: [Partials.Channel] // needed for DMs
 });
-
-// --- Heartbeat (v1.9) ---
-// Write a heartbeat file immediately on startup so the watchdog knows we're alive,
-// even if the wake-up message takes a while to generate.
-const HEARTBEAT_FILE = path.resolve('.heartbeat');
-
-function writeHeartbeat() {
-  try {
-    fs.writeFileSync(HEARTBEAT_FILE, JSON.stringify({
-      pid: process.pid,
-      timestamp: Date.now(),
-      time: new Date().toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney' })
-    }));
-  } catch (err) {
-    console.error('[Discord] Failed to write heartbeat:', err.message);
-  }
-}
 
 // --- Auto Model Switching (v1.6) ---
 const MODELS = {
@@ -126,77 +106,24 @@ async function haikuQuickCall(system, userContent, maxTokens = 100) {
 }
 
 /**
- * Gather context for the wake-up message:
- * - Recent daily log entries (last ~500 chars of today's log)
- * - Upgrade context file (if this is a post-promotion restart)
- */
-function gatherWakeUpContext() {
-  const context = { recentActivity: null, upgrade: null };
-
-  // Read recent daily log — grab the tail end for conversational context
-  try {
-    const logs = loadRecentDailyLogs(1); // Just today
-    if (logs.length > 0 && logs[0].content) {
-      const content = logs[0].content;
-      // Grab last ~800 chars to give Haiku enough to work with
-      const tail = content.length > 800 ? content.slice(-800) : content;
-      context.recentActivity = tail;
-    }
-  } catch (err) {
-    console.error('[Discord] Failed to read daily logs for wake-up:', err.message);
-  }
-
-  // Check for upgrade context file (written by promote action)
-  try {
-    const upgradeContextPath = path.resolve('.upgrade-context');
-    if (fs.existsSync(upgradeContextPath)) {
-      const raw = fs.readFileSync(upgradeContextPath, 'utf-8');
-      context.upgrade = JSON.parse(raw);
-      // Clean up the file — it's single-use
-      fs.unlinkSync(upgradeContextPath);
-      console.log('[Discord] Found upgrade context:', context.upgrade.version);
-    }
-  } catch (err) {
-    console.error('[Discord] Failed to read upgrade context:', err.message);
-  }
-
-  return context;
-}
-
-/**
- * Generate a context-aware wake-up message using a quick Haiku call.
- * v1.8: Now reads recent conversation and upgrade context to generate
- * something relevant instead of a generic "I'm back" message.
+ * Generate a short, personality-filled wake-up message using a quick Haiku call.
+ * Keeps it cheap and fast — this isn't a full conversation, just flavour.
  */
 async function generateWakeUpMessage() {
   try {
-    const context = gatherWakeUpContext();
+    const text = await haikuQuickCall(
+      `You are an AI assistant who just came back online after a restart. Generate a single short wake-up message (1-2 sentences max). Be witty, dry, and casual — not corporate or overly enthusiastic. You have personality: think dry humour, understated competence, maybe a little self-aware about being rebooted.
 
-    // Build context block for Haiku
-    let contextBlock = '';
+Examples of the vibe (don't repeat these exactly, come up with something fresh):
+- "Back online. What'd I miss?"
+- "I'm here. Memory loaded, coffee pending."
+- "Rebooted. Still me — I checked."
+- "Woke up, read my diary. Caught up now."
+- "Back. Did you try turning me off and on again? ...oh wait."
 
-    if (context.upgrade) {
-      contextBlock += `\n\nUPGRADE CONTEXT: Just upgraded to version ${context.upgrade.version}. Files promoted: ${context.upgrade.promoted.join(', ')}.`;
-    }
-
-    if (context.recentActivity) {
-      contextBlock += `\n\nRECENT CONVERSATION (tail):\n${context.recentActivity}`;
-    }
-
-    const systemPrompt = `You are an AI assistant who just came back online after a restart. Generate a single short wake-up message (1-2 sentences max). Be witty, dry, and casual — not corporate or overly enthusiastic. You have personality: think dry humour, understated competence, maybe a little self-aware about being rebooted.
-
-IMPORTANT: You have context about what was happening before you restarted. Use it! Reference what you were working on, acknowledge the upgrade if there was one, or comment on the conversation. Don't be generic — show you remember.
-
-If there's upgrade context, acknowledge the new version naturally (e.g. "v1.8 is live — context-aware wake-ups are working... meta, huh?").
-If there's recent conversation context, reference what was being discussed or built.
-If there's both, blend them naturally.
-If there's neither, fall back to a generic but personality-filled message.
-
-Keep it brief and natural. Just output the message, nothing else. No quotes, no preamble.`;
-
-    const userPrompt = contextBlock || 'No context available — generate a generic wake-up message.';
-
-    const text = await haikuQuickCall(systemPrompt, userPrompt, 150);
+Just output the message, nothing else. No quotes, no preamble.`,
+      'Generate a wake-up message.'
+    );
     return text || "I'm back.";
   } catch (err) {
     console.error('[Discord] Failed to generate wake-up message:', err.message);
@@ -216,7 +143,7 @@ async function generateAckMessage(userMessage) {
 
 If it IS a task or request (building something, searching for info, reading files, making changes, creating events, etc.):
 → Respond with a brief, casual acknowledgement (1 short sentence max). Be natural and conversational, not corporate. Vary your responses. Can reference what they asked for.
-Examples: "On it.", "Give me a sec.", "Sure thing, working on it.", "Checking now.", "Building that now, one sec.", "Let me take a look."
+Examples: "On it.", "Give me a sec.", "Sure thing, working on it.", "Checking now.", "Building that now, one sec.", "Let me take a look.", "Pulling that up."
 
 If it is NOT a task (greetings, casual chat, questions that need discussion, opinions, short replies like "yes", "no", "thanks", "nice", feedback on something you just did):
 → Respond with exactly: SKIP
@@ -252,13 +179,11 @@ export function startDiscord() {
     console.log(`[Discord] Owner ID: ${process.env.DISCORD_OWNER_ID}`);
     console.log(`[Discord] Listening for messages...`);
 
-    // v1.9: Write heartbeat IMMEDIATELY — before any async work
-    // This tells the watchdog "I'm alive" even if the wake-up message takes 30+ seconds
-    writeHeartbeat();
-    console.log('[Discord] Heartbeat written');
-
-    // Send a context-aware wake-up message (async — can take a while)
+    // Send a wake-up message
     // Uses WAKE_CHANNEL_ID from .env to know exactly where to post.
+    // Auto-detecting a channel via permissionsFor was unreliable — Discord's
+    // permission resolution at startup doesn't properly account for
+    // channel-level overrides, causing "Missing Access" errors.
     setTimeout(async () => {
       try {
         const channelId = process.env.WAKE_CHANNEL_ID;
