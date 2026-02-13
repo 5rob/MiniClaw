@@ -8,6 +8,7 @@ const PROJECT_ROOT = process.cwd();
 const STAGING_DIR = path.join(PROJECT_ROOT, 'staging');
 const RESTART_SIGNAL = path.join(PROJECT_ROOT, '.restart-signal');
 const STAGING_LOG_MAX = 50; // Keep last N lines of staging output
+const IS_STAGING = process.env.BOT_ROLE === 'staging';
 
 let stagingProcess = null;
 let stagingLog = [];
@@ -30,6 +31,23 @@ function addLog(source, data) {
   }
 }
 
+// Parse a .env file and return key-value pairs
+function parseDotEnv(filePath) {
+  const env = {};
+  if (!fs.existsSync(filePath)) return env;
+  const content = fs.readFileSync(filePath, 'utf-8');
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIndex = trimmed.indexOf('=');
+    if (eqIndex === -1) continue;
+    const key = trimmed.slice(0, eqIndex).trim();
+    const value = trimmed.slice(eqIndex + 1).trim().replace(/^["']|["']$/g, '');
+    env[key] = value;
+  }
+  return env;
+}
+
 function startStaging() {
   if (stagingProcess && !stagingProcess.killed) {
     return { success: false, error: 'Staging bot is already running. Stop it first or use restart.' };
@@ -41,19 +59,27 @@ function startStaging() {
   }
 
   // Check staging has its own .env
-  if (!fs.existsSync(path.join(STAGING_DIR, '.env'))) {
+  const stagingEnvPath = path.join(STAGING_DIR, '.env');
+  if (!fs.existsSync(stagingEnvPath)) {
     return { success: false, error: 'Staging .env not found. The test bot needs its own Discord token.' };
   }
 
   stagingLog = [];
 
   try {
+    // Build a clean environment for the staging bot.
+    // We must read the staging .env and let those values OVERRIDE the inherited
+    // parent env, because dotenv won't overwrite env vars that already exist.
+    // Without this, the staging bot inherits the live bot's DISCORD_TOKEN
+    // and logs in as the wrong bot.
+    const stagingEnvOverrides = parseDotEnv(stagingEnvPath);
+    const stagingEnv = { ...process.env, FORCE_COLOR: '0', ...stagingEnvOverrides };
+
     stagingProcess = spawn('node', ['src/index.js'], {
       cwd: STAGING_DIR,
       stdio: ['ignore', 'pipe', 'pipe'],
-      // Don't let staging inherit our env — it has its own .env
-      env: { ...process.env, FORCE_COLOR: '0' },
-      // Detach so we can kill it cleanly
+      env: stagingEnv,
+      // Don't detach — we want to manage lifecycle directly
       detached: false
     });
 
@@ -170,6 +196,18 @@ export const toolDefinition = {
 
 // Main execute function
 export async function execute(input) {
+  // Staging bot should NOT be able to manage staging processes — that's the live bot's job.
+  // Without this guard, the staging bot tries to spawn into staging/staging/ which doesn't exist.
+  if (IS_STAGING) {
+    const stagingBlocked = ['start', 'stop', 'restart', 'status'];
+    if (stagingBlocked.includes(input.action)) {
+      return {
+        success: false,
+        error: "I'm the staging instance — process management is handled by the live bot. Ask in the main channel if you need to restart me."
+      };
+    }
+  }
+
   switch (input.action) {
     case 'start':
       return startStaging();

@@ -1,8 +1,9 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
-import { Client, GatewayIntentBits, Partials } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
+import Anthropic from '@anthropic-ai/sdk';
 
 const client = new Client({
   intents: [
@@ -13,6 +14,37 @@ const client = new Client({
   ],
   partials: [Partials.Channel] // needed for DMs
 });
+
+/**
+ * Generate a short, personality-filled wake-up message using a quick Haiku call.
+ * Keeps it cheap and fast — this isn't a full conversation, just flavour.
+ */
+async function generateWakeUpMessage() {
+  try {
+    const anthropic = new Anthropic(); // Uses ANTHROPIC_API_KEY from env
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 100,
+      system: `You are an AI assistant who just came back online after a restart. Generate a single short wake-up message (1-2 sentences max). Be witty, dry, and casual — not corporate or overly enthusiastic. You have personality: think dry humour, understated competence, maybe a little self-aware about being rebooted.
+
+Examples of the vibe (don't repeat these exactly, come up with something fresh):
+- "Back online. What'd I miss?"
+- "I'm here. Memory loaded, coffee pending."
+- "Rebooted. Still me — I checked."
+- "Woke up, read my diary. Caught up now."
+- "Back. Did you try turning me off and on again? ...oh wait."
+
+Just output the message, nothing else. No quotes, no preamble.`,
+      messages: [{ role: 'user', content: 'Generate a wake-up message.' }]
+    });
+
+    const text = response.content[0]?.text?.trim();
+    return text || "I'm back.";
+  } catch (err) {
+    console.error('[Discord] Failed to generate wake-up message:', err.message);
+    return "I'm back online."; // Fallback if API call fails
+  }
+}
 
 export function startDiscord() {
   if (!process.env.DISCORD_TOKEN) {
@@ -27,10 +59,32 @@ export function startDiscord() {
     process.exit(1);
   }
 
-  client.on('ready', () => {
+  client.on('ready', async () => {
     console.log(`[Discord] Logged in as ${client.user.tag}`);
     console.log(`[Discord] Owner ID: ${process.env.DISCORD_OWNER_ID}`);
     console.log(`[Discord] Listening for messages...`);
+
+    // Send a wake-up message to each guild
+    try {
+      const wakeUpMsg = await generateWakeUpMessage();
+      console.log(`[Discord] Wake-up message: "${wakeUpMsg}"`);
+
+      for (const guild of client.guilds.cache.values()) {
+        // Find the first text channel the bot can send to
+        const channel = guild.channels.cache.find(
+          ch => ch.type === ChannelType.GuildText && 
+                ch.permissionsFor(guild.members.me)?.has('SendMessages')
+        );
+
+        if (channel) {
+          await channel.send(wakeUpMsg);
+          console.log(`[Discord] Sent wake-up to #${channel.name} in ${guild.name}`);
+        }
+      }
+    } catch (err) {
+      console.error('[Discord] Error sending wake-up message:', err.message);
+      // Non-fatal — bot continues working even if wake-up fails
+    }
   });
 
   client.on('messageCreate', async (message) => {
