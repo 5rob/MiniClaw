@@ -56,10 +56,16 @@ function buildSystemPrompt() {
     ? recentLogs.map(l => `### ${l.date}\n${l.content}`).join('\n')
     : '(No recent daily logs)';
 
+  // Check if this is the staging/test instance
+  const botRole = process.env.BOT_ROLE || 'live';
+  const stagingNotice = botRole === 'staging'
+    ? `\n\n## ⚠️ Staging Instance Notice\nYou are **Tester Bud**, the staging/test instance. You exist for testing new features in the #staging channel. You share memory with the live bot but you are NOT the live bot. When greeted, identify yourself as Tester Bud. Do not claim to be the main/live instance. Your purpose is to test experimental changes safely before they go live.\n`
+    : '';
+
   return `${soul || '(No SOUL.md found — create one to define your personality)'}
 
 ${identity ? `## Identity\n${identity}` : ''}
-
+${stagingNotice}
 Current date/time: ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney' })}
 
 ## Your Long-Term Memory
@@ -72,6 +78,11 @@ ${dailyLogSection}
 ${skillDescriptions || '(No custom skills installed yet)'}
 
 ## Guidelines
+- Budget your tool calls carefully. You have a limited number of tool calls per response.
+  Prioritise: do the essential work first (read, write, execute), then respond to the user.
+  Do not spend tool calls on verification reads or log checks unless the user specifically asks.
+  If you've completed the task, just tell the user what you did — don't re-read files to confirm.
+- When editing files with file_manager, read the file once, make all changes in memory, then write the complete updated file in a single write call. Do not make multiple partial writes or re-read the same file repeatedly.
 - When I say "remember this" or share important info, write it to long-term memory immediately using memory_write.
 - Log significant events and task completions to the daily log using memory_append_daily.
 - Before answering questions about my preferences or past events, search memory using memory_search.
@@ -141,7 +152,7 @@ export async function chat(channelId, userMessage) {
     let messages = [...history];
     let response;
     let iterations = 0;
-    const MAX_ITERATIONS = 10; // Prevent infinite tool loops
+    const MAX_ITERATIONS = 30; // Prevent infinite tool loops
 
     // Tool use loop — keep going until Claude stops calling tools
     while (iterations < MAX_ITERATIONS) {

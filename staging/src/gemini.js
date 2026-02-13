@@ -16,7 +16,7 @@ function getClient() {
 }
 
 // --- Vision (image understanding) ---
-const VISION_MODEL = 'gemini-2.5-flash';
+const VISION_MODEL = 'gemini-2.5-flash-image';
 
 // Supported image types
 const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'];
