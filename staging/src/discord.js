@@ -65,26 +65,48 @@ export function startDiscord() {
     console.log(`[Discord] Listening for messages...`);
 
     // Send a wake-up message to each guild
-    try {
-      const wakeUpMsg = await generateWakeUpMessage();
-      console.log(`[Discord] Wake-up message: "${wakeUpMsg}"`);
+    // Small delay to let guild/channel cache fully populate
+    setTimeout(async () => {
+      try {
+        const wakeUpMsg = await generateWakeUpMessage();
+        console.log(`[Discord] Wake-up message: "${wakeUpMsg}"`);
 
-      for (const guild of client.guilds.cache.values()) {
-        // Find the first text channel the bot can send to
-        const channel = guild.channels.cache.find(
-          ch => ch.type === ChannelType.GuildText && 
-                ch.permissionsFor(guild.members.me)?.has('SendMessages')
-        );
+        for (const guild of client.guilds.cache.values()) {
+          // Fetch channels fresh instead of relying on cache, which may be
+          // empty or incomplete when the ready event first fires
+          let channels;
+          try {
+            channels = await guild.channels.fetch();
+          } catch (fetchErr) {
+            console.error(`[Discord] Failed to fetch channels for ${guild.name}:`, fetchErr.message);
+            continue;
+          }
 
-        if (channel) {
-          await channel.send(wakeUpMsg);
-          console.log(`[Discord] Sent wake-up to #${channel.name} in ${guild.name}`);
+          // Find the first text channel the bot can send to.
+          // Use client.user.id for the permissions check instead of
+          // guild.members.me, which can be null at startup.
+          const channel = channels.find(ch => {
+            if (!ch || ch.type !== ChannelType.GuildText) return false;
+            try {
+              const perms = ch.permissionsFor(client.user.id);
+              return perms && perms.has('SendMessages');
+            } catch {
+              return false;
+            }
+          });
+
+          if (channel) {
+            await channel.send(wakeUpMsg);
+            console.log(`[Discord] Sent wake-up to #${channel.name} in ${guild.name}`);
+          } else {
+            console.warn(`[Discord] No sendable text channel found in ${guild.name}`);
+          }
         }
+      } catch (err) {
+        console.error('[Discord] Error sending wake-up message:', err.message);
+        // Non-fatal — bot continues working even if wake-up fails
       }
-    } catch (err) {
-      console.error('[Discord] Error sending wake-up message:', err.message);
-      // Non-fatal — bot continues working even if wake-up fails
-    }
+    }, 2000); // 2 second delay for cache to populate
   });
 
   client.on('messageCreate', async (message) => {
@@ -190,6 +212,7 @@ Just chat normally for AI assistance!`;
       // Get response from Claude
       const response = await chat(message.channel.id, content);
 
+      // Don't send empty messages (can happen if Claude only used tools with no text reply)
       if (!response || response.trim().length === 0) {
         await message.reply("✅ *(done — tools executed, no text response)*");
         return;
