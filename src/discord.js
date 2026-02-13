@@ -1,8 +1,9 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
-import { Client, GatewayIntentBits, Partials } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
+import Anthropic from '@anthropic-ai/sdk';
 
 const client = new Client({
   intents: [
@@ -13,6 +14,37 @@ const client = new Client({
   ],
   partials: [Partials.Channel] // needed for DMs
 });
+
+/**
+ * Generate a short, personality-filled wake-up message using a quick Haiku call.
+ * Keeps it cheap and fast — this isn't a full conversation, just flavour.
+ */
+async function generateWakeUpMessage() {
+  try {
+    const anthropic = new Anthropic(); // Uses ANTHROPIC_API_KEY from env
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 100,
+      system: `You are an AI assistant who just came back online after a restart. Generate a single short wake-up message (1-2 sentences max). Be witty, dry, and casual — not corporate or overly enthusiastic. You have personality: think dry humour, understated competence, maybe a little self-aware about being rebooted.
+
+Examples of the vibe (don't repeat these exactly, come up with something fresh):
+- "Back online. What'd I miss?"
+- "I'm here. Memory loaded, coffee pending."
+- "Rebooted. Still me — I checked."
+- "Woke up, read my diary. Caught up now."
+- "Back. Did you try turning me off and on again? ...oh wait."
+
+Just output the message, nothing else. No quotes, no preamble.`,
+      messages: [{ role: 'user', content: 'Generate a wake-up message.' }]
+    });
+
+    const text = response.content[0]?.text?.trim();
+    return text || "I'm back.";
+  } catch (err) {
+    console.error('[Discord] Failed to generate wake-up message:', err.message);
+    return "I'm back online."; // Fallback if API call fails
+  }
+}
 
 export function startDiscord() {
   if (!process.env.DISCORD_TOKEN) {
@@ -27,10 +59,39 @@ export function startDiscord() {
     process.exit(1);
   }
 
-  client.on('ready', () => {
+  client.on('ready', async () => {
     console.log(`[Discord] Logged in as ${client.user.tag}`);
     console.log(`[Discord] Owner ID: ${process.env.DISCORD_OWNER_ID}`);
     console.log(`[Discord] Listening for messages...`);
+
+    // Send a wake-up message
+    // Uses WAKE_CHANNEL_ID from .env to know exactly where to post.
+    // Auto-detecting a channel via permissionsFor was unreliable — Discord's
+    // permission resolution at startup doesn't properly account for
+    // channel-level overrides, causing "Missing Access" errors.
+    setTimeout(async () => {
+      try {
+        const channelId = process.env.WAKE_CHANNEL_ID;
+        if (!channelId) {
+          console.log('[Discord] No WAKE_CHANNEL_ID set in .env, skipping wake-up message');
+          return;
+        }
+
+        const channel = await client.channels.fetch(channelId);
+        if (!channel) {
+          console.warn(`[Discord] Wake-up channel ${channelId} not found`);
+          return;
+        }
+
+        const wakeUpMsg = await generateWakeUpMessage();
+        console.log(`[Discord] Wake-up message: "${wakeUpMsg}"`);
+        await channel.send(wakeUpMsg);
+        console.log(`[Discord] Sent wake-up to #${channel.name}`);
+      } catch (err) {
+        console.error('[Discord] Error sending wake-up message:', err.message);
+        // Non-fatal — bot continues working even if wake-up fails
+      }
+    }, 2000); // 2 second delay for cache to populate
   });
 
   client.on('messageCreate', async (message) => {
@@ -136,6 +197,7 @@ Just chat normally for AI assistance!`;
       // Get response from Claude
       const response = await chat(message.channel.id, content);
 
+      // Don't send empty messages (can happen if Claude only used tools with no text reply)
       if (!response || response.trim().length === 0) {
         await message.reply("✅ *(done — tools executed, no text response)*");
         return;

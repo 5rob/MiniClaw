@@ -6,7 +6,7 @@
   "model": {
     "primary": "claude-opus-4-6",
     "fallback": "claude-haiku-4-5-20251001",
-    "maxTokens": 4096,
+    "maxTokens": 16384,
     "contextWindow": 200000
   },
   "memory": {

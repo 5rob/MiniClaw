@@ -1,37 +1,76 @@
 // skills/process-manager/handler.js
-// Manages staging bot process and self-restart signaling
+// Manages staging bot process, self-restart signaling, and promotion
+// v1.5 — Added promote action (auto-deploy staging to live)
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { promote } from './promote.js';
 
 const PROJECT_ROOT = process.cwd();
 const STAGING_DIR = path.join(PROJECT_ROOT, 'staging');
 const RESTART_SIGNAL = path.join(PROJECT_ROOT, '.restart-signal');
-const STAGING_LOG_MAX = 50; // Keep last N lines of staging output
+const STAGING_LOG_MAX = 200; // Keep last N lines in memory
 const IS_STAGING = process.env.BOT_ROLE === 'staging';
+
+// Log file paths
+const STAGING_LOG_DIR = path.join(STAGING_DIR, 'logs');
+const STAGING_LOG_FILE = path.join(STAGING_LOG_DIR, 'staging.log');
+const LIVE_LOG_DIR = path.join(PROJECT_ROOT, 'logs');
+const LIVE_LOG_FILE = path.join(LIVE_LOG_DIR, 'live.log');
+const MAX_LOG_SIZE = 512 * 1024; // 512KB — rotate when exceeded
 
 let stagingProcess = null;
 let stagingLog = [];
+
+function ensureDir(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+}
+
+function rotateLogIfNeeded(logFile) {
+  try {
+    if (!fs.existsSync(logFile)) return;
+    const stats = fs.statSync(logFile);
+    if (stats.size > MAX_LOG_SIZE) {
+      const content = fs.readFileSync(logFile, 'utf-8');
+      const lines = content.split('\n');
+      const keepFrom = Math.floor(lines.length / 2);
+      fs.writeFileSync(logFile, lines.slice(keepFrom).join('\n'));
+    }
+  } catch (err) {
+    console.error(`[ProcessManager] Log rotation error: ${err.message}`);
+  }
+}
+
+function appendToLogFile(logFile, line) {
+  try {
+    const logDir = path.dirname(logFile);
+    ensureDir(logDir);
+    rotateLogIfNeeded(logFile);
+    fs.appendFileSync(logFile, line + '\n');
+  } catch (err) {
+    console.error(`[ProcessManager] Failed to write log: ${err.message}`);
+  }
+}
 
 function addLog(source, data) {
   const lines = data.toString().trim().split('\n');
   for (const line of lines) {
     const entry = `[${new Date().toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney' })}] [${source}] ${line}`;
     stagingLog.push(entry);
-    // Also echo to live bot's console for visibility
+    appendToLogFile(STAGING_LOG_FILE, entry);
     if (source === 'stderr') {
       console.error(`[StagingBot] ${line}`);
     } else {
       console.log(`[StagingBot] ${line}`);
     }
   }
-  // Trim log
   if (stagingLog.length > STAGING_LOG_MAX) {
     stagingLog = stagingLog.slice(-STAGING_LOG_MAX);
   }
 }
 
-// Parse a .env file and return key-value pairs
 function parseDotEnv(filePath) {
   const env = {};
   if (!fs.existsSync(filePath)) return env;
@@ -53,25 +92,20 @@ function startStaging() {
     return { success: false, error: 'Staging bot is already running. Stop it first or use restart.' };
   }
 
-  // Check staging directory exists
   if (!fs.existsSync(STAGING_DIR)) {
     return { success: false, error: 'Staging directory not found at: ' + STAGING_DIR };
   }
 
-  // Check staging has its own .env
   const stagingEnvPath = path.join(STAGING_DIR, '.env');
   if (!fs.existsSync(stagingEnvPath)) {
     return { success: false, error: 'Staging .env not found. The test bot needs its own Discord token.' };
   }
 
   stagingLog = [];
+  ensureDir(STAGING_LOG_DIR);
+  appendToLogFile(STAGING_LOG_FILE, `\n${'='.repeat(60)}\n[${new Date().toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney' })}] === Staging bot starting ===\n${'='.repeat(60)}`);
 
   try {
-    // Build a clean environment for the staging bot.
-    // We must read the staging .env and let those values OVERRIDE the inherited
-    // parent env, because dotenv won't overwrite env vars that already exist.
-    // Without this, the staging bot inherits the live bot's DISCORD_TOKEN
-    // and logs in as the wrong bot.
     const stagingEnvOverrides = parseDotEnv(stagingEnvPath);
     const stagingEnv = { ...process.env, FORCE_COLOR: '0', ...stagingEnvOverrides };
 
@@ -79,7 +113,6 @@ function startStaging() {
       cwd: STAGING_DIR,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: stagingEnv,
-      // Don't detach — we want to manage lifecycle directly
       detached: false
     });
 
@@ -114,7 +147,6 @@ function stopStaging() {
   const pid = stagingProcess.pid;
 
   try {
-    // On Windows, we need to kill the process tree
     if (process.platform === 'win32') {
       spawn('taskkill', ['/pid', pid.toString(), '/f', '/t'], { stdio: 'ignore' });
     } else {
@@ -129,7 +161,6 @@ function stopStaging() {
 
 function restartStaging() {
   const stopResult = stopStaging();
-  // Small delay to let the process fully die
   return new Promise((resolve) => {
     setTimeout(() => {
       const startResult = startStaging();
@@ -153,8 +184,38 @@ function getStatus() {
   };
 }
 
+function readLogs(input) {
+  const target = input.target || 'staging';
+  const lines = input.lines || 50;
+
+  const logFile = target === 'live' ? LIVE_LOG_FILE : STAGING_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    return {
+      success: false,
+      error: `No log file found at ${logFile}. The ${target} bot may not have run yet.`
+    };
+  }
+
+  try {
+    const content = fs.readFileSync(logFile, 'utf-8');
+    const allLines = content.split('\n').filter(l => l.trim());
+    const tail = allLines.slice(-lines);
+
+    return {
+      success: true,
+      target,
+      logFile,
+      totalLines: allLines.length,
+      returnedLines: tail.length,
+      logs: tail.join('\n')
+    };
+  } catch (err) {
+    return { success: false, error: `Failed to read logs: ${err.message}` };
+  }
+}
+
 function signalSelfRestart(reason = 'Manual restart requested') {
-  // Write a signal file that the watchdog will pick up
   const signal = {
     timestamp: new Date().toISOString(),
     reason,
@@ -176,18 +237,39 @@ function signalSelfRestart(reason = 'Manual restart requested') {
 // Tool definition for Anthropic tool_use
 export const toolDefinition = {
   name: 'process_manager',
-  description: 'Manage the staging/test bot process and signal self-restarts. Actions: start (launch staging bot), stop (kill staging bot), restart (stop+start staging bot), status (check if running + recent logs), self_restart (signal watchdog to restart live bot).',
+  description: 'Manage the staging/test bot process and signal self-restarts. Actions: start (launch staging bot), stop (kill staging bot), restart (stop+start staging bot), status (check if running + recent logs), read_logs (read persistent log files for staging or live bot), self_restart (signal watchdog to restart live bot), promote (deploy staging to live with backup and restart).',
   input_schema: {
     type: 'object',
     properties: {
       action: {
         type: 'string',
-        enum: ['start', 'stop', 'restart', 'status', 'self_restart'],
+        enum: ['start', 'stop', 'restart', 'status', 'read_logs', 'self_restart', 'promote'],
         description: 'What to do with the process'
       },
       reason: {
         type: 'string',
         description: 'Reason for self_restart (optional, for logging)'
+      },
+      target: {
+        type: 'string',
+        enum: ['staging', 'live'],
+        description: 'For read_logs: which log to read (default: staging)'
+      },
+      lines: {
+        type: 'number',
+        description: 'For read_logs: how many lines from the tail to return (default: 50)'
+      },
+      version: {
+        type: 'string',
+        description: 'For promote: version label for the backup (e.g. "v1.5")'
+      },
+      dryRun: {
+        type: 'boolean',
+        description: 'For promote: if true, show what would happen without making changes'
+      },
+      skipRestart: {
+        type: 'boolean',
+        description: 'For promote: if true, copy files but don\'t signal restart'
       }
     },
     required: ['action']
@@ -196,14 +278,12 @@ export const toolDefinition = {
 
 // Main execute function
 export async function execute(input) {
-  // Staging bot should NOT be able to manage staging processes — that's the live bot's job.
-  // Without this guard, the staging bot tries to spawn into staging/staging/ which doesn't exist.
   if (IS_STAGING) {
-    const stagingBlocked = ['start', 'stop', 'restart', 'status'];
+    const stagingBlocked = ['start', 'stop', 'restart', 'status', 'promote'];
     if (stagingBlocked.includes(input.action)) {
       return {
         success: false,
-        error: "I'm the staging instance — process management is handled by the live bot. Ask in the main channel if you need to restart me."
+        error: "I'm the staging instance — process management and promotion are handled by the live bot."
       };
     }
   }
@@ -217,8 +297,22 @@ export async function execute(input) {
       return await restartStaging();
     case 'status':
       return getStatus();
+    case 'read_logs':
+      return readLogs(input);
     case 'self_restart':
       return signalSelfRestart(input.reason || 'Manual restart');
+    case 'promote': {
+      // Stop staging bot first if it's running
+      if (stagingProcess && !stagingProcess.killed) {
+        const stopResult = stopStaging();
+        if (!stopResult.success) {
+          return { success: false, error: `Failed to stop staging bot before promotion: ${stopResult.error}` };
+        }
+        // Give it a moment to clean up
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      return promote(input);
+    }
     default:
       return { success: false, error: `Unknown action: ${input.action}` };
   }

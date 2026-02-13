@@ -78,6 +78,7 @@ ${dailyLogSection}
 ${skillDescriptions || '(No custom skills installed yet)'}
 
 ## Guidelines
+- When editing files with file_manager, read the file once, make all changes in memory, then write the complete updated file in a single write call. Do not make multiple partial writes or re-read the same file repeatedly.
 - When I say "remember this" or share important info, write it to long-term memory immediately using memory_write.
 - Log significant events and task completions to the daily log using memory_append_daily.
 - Before answering questions about my preferences or past events, search memory using memory_search.
