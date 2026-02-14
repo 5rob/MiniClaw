@@ -26,3 +26,15 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Staging (experimental, shouldn't be in repo)
+staging/
+
+# Backups (deployment snapshots)
+backups/
+
+# Temp files (generated images, etc)
+temp/
+
+# Restart signal file
+.restart-signal

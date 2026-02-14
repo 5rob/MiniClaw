@@ -1,5 +1,5 @@
 // promote.js — Auto-promotion from staging to live
-// Part of process-manager v1.10
+// Part of process-manager v1.11
 // Copies everything from staging/ to live EXCEPT protected paths.
 // This ensures nothing gets missed when new files/dirs are added to staging.
 import fs from 'fs';
@@ -19,6 +19,8 @@ const NEVER_PROMOTE = new Set([
   'SOUL.md',          // Live has its own personality — staging is "Test Bud"
   'IDENTITY.md',      // Live has its own identity
   'memory',           // Each instance has completely separate memory
+  'data',             // Memory index database (sqlite) — locked at runtime
+  'temp',             // Transient files (generated images, etc)
   'logs',             // Each instance has its own logs
   'node_modules',     // Dependencies managed separately (might differ)
   'package-lock.json',// Tied to node_modules

@@ -1,6 +1,6 @@
 # process-manager
 
-Manages child processes — primarily the staging/test bot (Test Bud), but also handles self-restart signaling for live upgrades and promotion from staging to live.
+Manages child processes — primarily the staging/test bot (Test Bud), but also handles self-restart signaling for live upgrades, promotion from staging to live, and reverting staging to match live.
 
 ## Capabilities
 - **start** — Launch the staging bot as a child process (Test Bud has its own memory, soul, and identity)
@@ -10,6 +10,7 @@ Manages child processes — primarily the staging/test bot (Test Bud), but also 
 - **read_logs** — Read persistent log files (staging or live) from disk
 - **self_restart** — Signal the watchdog to restart the live bot (for upgrades)
 - **promote** — Deploy staging code to live with backup and restart
+- **revert** — Reset staging to match live (clean slate for new builds)
 
 ## Staging Architecture (v1.10)
 - **Separate Identity**: Test Bud has its own `SOUL.md`, `IDENTITY.md`, and `memory/` directory
@@ -19,13 +20,20 @@ Manages child processes — primarily the staging/test bot (Test Bud), but also 
 ## Promotion Rules
 When promoting staging to live, the following are copied: `src/`, `skills/`, `config.json`, `package.json`, `watchdog.js`, and any other new files/directories.
 
-The following are **NEVER** promoted (each instance keeps its own):
+The following are **NEVER** promoted or reverted (each instance keeps its own):
 - `.env` — Different Discord tokens, API keys, WAKE_CHANNEL_ID
 - `SOUL.md` / `IDENTITY.md` — Live has its own personality
 - `memory/` — Each instance has completely separate memory
 - `logs/` — Each instance has its own logs
 - `node_modules/` / `package-lock.json` — Dependencies managed separately
 - `backups/` / `staging/` — Meta directories
+
+## Revert (v1.11+)
+- Copies all promotable paths from live → staging
+- Same exclusion rules as promotion (instance-specific files stay untouched)
+- Stops the staging bot first if running
+- Use `dryRun: true` to preview what would be copied
+- Use after a failed experiment to get a clean starting point
 
 ## Versioning
 - Version auto-increments from the last backup: v1.9 → v1.10 → v1.11 (not v2.0)

@@ -1,10 +1,11 @@
 // skills/process-manager/handler.js
-// Manages staging bot process, self-restart signaling, and promotion
-// v1.10 — Separate staging identity/memory, proper versioning (1.10 after 1.9)
+// Manages staging bot process, self-restart signaling, promotion, and revert
+// v1.11 — Added revert action (reset staging to match live)
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { promote } from './promote.js';
+import { revert } from './revert.js';
 
 const PROJECT_ROOT = process.cwd();
 const STAGING_DIR = path.join(PROJECT_ROOT, 'staging');
@@ -249,13 +250,13 @@ function signalSelfRestart(reason = 'Manual restart requested') {
 // Tool definition for Anthropic tool_use
 export const toolDefinition = {
   name: 'process_manager',
-  description: 'Manage the staging/test bot process and signal self-restarts. Actions: start (launch staging bot), stop (kill staging bot), restart (stop+start staging bot), status (check if running + recent logs), read_logs (read persistent log files for staging or live bot), self_restart (signal watchdog to restart live bot), promote (deploy staging to live with backup and restart). Staging bot (Test Bud) has its own separate memory, soul, and identity.',
+  description: 'Manage the staging/test bot process and signal self-restarts. Actions: start (launch staging bot), stop (kill staging bot), restart (stop+start staging bot), status (check if running + recent logs), read_logs (read persistent log files for staging or live bot), self_restart (signal watchdog to restart live bot), promote (deploy staging to live with backup and restart), revert (reset staging to match live — clean slate for new builds). Staging bot (Test Bud) has its own separate memory, soul, and identity.',
   input_schema: {
     type: 'object',
     properties: {
       action: {
         type: 'string',
-        enum: ['start', 'stop', 'restart', 'status', 'read_logs', 'self_restart', 'promote'],
+        enum: ['start', 'stop', 'restart', 'status', 'read_logs', 'self_restart', 'promote', 'revert'],
         description: 'What to do with the process'
       },
       reason: {
@@ -277,7 +278,7 @@ export const toolDefinition = {
       },
       dryRun: {
         type: 'boolean',
-        description: 'For promote: if true, show what would happen without making changes'
+        description: 'For promote/revert: if true, show what would happen without making changes'
       },
       skipRestart: {
         type: 'boolean',
@@ -291,11 +292,11 @@ export const toolDefinition = {
 // Main execute function
 export async function execute(input) {
   if (IS_STAGING) {
-    const stagingBlocked = ['start', 'stop', 'restart', 'status', 'promote'];
+    const stagingBlocked = ['start', 'stop', 'restart', 'status', 'promote', 'revert'];
     if (stagingBlocked.includes(input.action)) {
       return {
         success: false,
-        error: "I'm the staging instance (Test Bud) — process management and promotion are handled by the live bot."
+        error: "I'm the staging instance (Test Bud) — process management, promotion, and revert are handled by the live bot."
       };
     }
   }
@@ -324,6 +325,17 @@ export async function execute(input) {
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
       return promote(input);
+    }
+    case 'revert': {
+      // Stop staging bot first if it's running
+      if (stagingProcess && !stagingProcess.killed) {
+        const stopResult = stopStaging();
+        if (!stopResult.success) {
+          return { success: false, error: `Failed to stop staging bot before revert: ${stopResult.error}` };
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      return revert(input);
     }
     default:
       return { success: false, error: `Unknown action: ${input.action}` };
