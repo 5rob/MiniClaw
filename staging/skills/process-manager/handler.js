@@ -1,10 +1,11 @@
 // skills/process-manager/handler.js
-// Manages staging bot process, self-restart signaling, and promotion
-// v1.5 — Added promote action (auto-deploy staging to live)
+// Manages staging bot process, self-restart signaling, promotion, and revert
+// v1.11 — Added revert action (reset staging to match live)
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { promote } from './promote.js';
+import { revert } from './revert.js';
 
 const PROJECT_ROOT = process.cwd();
 const STAGING_DIR = path.join(PROJECT_ROOT, 'staging');
@@ -101,11 +102,23 @@ function startStaging() {
     return { success: false, error: 'Staging .env not found. The test bot needs its own Discord token.' };
   }
 
+  // Ensure staging has its own memory directory
+  const stagingMemory = path.join(STAGING_DIR, 'memory');
+  if (!fs.existsSync(stagingMemory)) {
+    ensureDir(stagingMemory);
+    // Create a starter long-term memory file if none exists
+    const ltmFile = path.join(stagingMemory, 'long-term.md');
+    if (!fs.existsSync(ltmFile)) {
+      fs.writeFileSync(ltmFile, '# Test Bud — Long-Term Memory\n\n(New memory space — Test Bud\'s own memories start here)\n');
+    }
+  }
+
   stagingLog = [];
   ensureDir(STAGING_LOG_DIR);
   appendToLogFile(STAGING_LOG_FILE, `\n${'='.repeat(60)}\n[${new Date().toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney' })}] === Staging bot starting ===\n${'='.repeat(60)}`);
 
   try {
+    // Parse staging .env and override inherited env vars
     const stagingEnvOverrides = parseDotEnv(stagingEnvPath);
     const stagingEnv = { ...process.env, FORCE_COLOR: '0', ...stagingEnvOverrides };
 
@@ -131,7 +144,7 @@ function startStaging() {
 
     return {
       success: true,
-      message: `Staging bot started (PID: ${stagingProcess.pid})`,
+      message: `Staging bot started (PID: ${stagingProcess.pid}). Test Bud has its own memory, soul, and identity.`,
       pid: stagingProcess.pid
     };
   } catch (err) {
@@ -237,13 +250,13 @@ function signalSelfRestart(reason = 'Manual restart requested') {
 // Tool definition for Anthropic tool_use
 export const toolDefinition = {
   name: 'process_manager',
-  description: 'Manage the staging/test bot process and signal self-restarts. Actions: start (launch staging bot), stop (kill staging bot), restart (stop+start staging bot), status (check if running + recent logs), read_logs (read persistent log files for staging or live bot), self_restart (signal watchdog to restart live bot), promote (deploy staging to live with backup and restart).',
+  description: 'Manage the staging/test bot process and signal self-restarts. Actions: start (launch staging bot), stop (kill staging bot), restart (stop+start staging bot), status (check if running + recent logs), read_logs (read persistent log files for staging or live bot), self_restart (signal watchdog to restart live bot), promote (deploy staging to live with backup and restart), revert (reset staging to match live — clean slate for new builds). Staging bot (Test Bud) has its own separate memory, soul, and identity.',
   input_schema: {
     type: 'object',
     properties: {
       action: {
         type: 'string',
-        enum: ['start', 'stop', 'restart', 'status', 'read_logs', 'self_restart', 'promote'],
+        enum: ['start', 'stop', 'restart', 'status', 'read_logs', 'self_restart', 'promote', 'revert'],
         description: 'What to do with the process'
       },
       reason: {
@@ -261,11 +274,11 @@ export const toolDefinition = {
       },
       version: {
         type: 'string',
-        description: 'For promote: version label for the backup (e.g. "v1.5")'
+        description: 'For promote: version label (e.g. "v1.10"). If omitted, auto-increments from last backup.'
       },
       dryRun: {
         type: 'boolean',
-        description: 'For promote: if true, show what would happen without making changes'
+        description: 'For promote/revert: if true, show what would happen without making changes'
       },
       skipRestart: {
         type: 'boolean',
@@ -279,11 +292,11 @@ export const toolDefinition = {
 // Main execute function
 export async function execute(input) {
   if (IS_STAGING) {
-    const stagingBlocked = ['start', 'stop', 'restart', 'status', 'promote'];
+    const stagingBlocked = ['start', 'stop', 'restart', 'status', 'promote', 'revert'];
     if (stagingBlocked.includes(input.action)) {
       return {
         success: false,
-        error: "I'm the staging instance — process management and promotion are handled by the live bot."
+        error: "I'm the staging instance (Test Bud) — process management, promotion, and revert are handled by the live bot."
       };
     }
   }
@@ -312,6 +325,17 @@ export async function execute(input) {
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
       return promote(input);
+    }
+    case 'revert': {
+      // Stop staging bot first if it's running
+      if (stagingProcess && !stagingProcess.killed) {
+        const stopResult = stopStaging();
+        if (!stopResult.success) {
+          return { success: false, error: `Failed to stop staging bot before revert: ${stopResult.error}` };
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      return revert(input);
     }
     default:
       return { success: false, error: `Unknown action: ${input.action}` };

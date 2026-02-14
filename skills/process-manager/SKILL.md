@@ -1,16 +1,38 @@
 # process-manager
 
-Manages child processes — primarily the staging/test bot, but also handles self-restart signaling for live upgrades.
+Manages child processes — primarily the staging/test bot (Test Bud), but also handles self-restart signaling for live upgrades and promotion from staging to live.
 
 ## Capabilities
-- **start** — Launch the staging bot as a child process
+- **start** — Launch the staging bot as a child process (Test Bud has its own memory, soul, and identity)
 - **stop** — Kill the staging bot process
 - **restart** — Stop then start the staging bot
 - **status** — Check if staging bot is running + recent in-memory logs
 - **read_logs** — Read persistent log files (staging or live) from disk
 - **self_restart** — Signal the watchdog to restart the live bot (for upgrades)
+- **promote** — Deploy staging code to live with backup and restart
 
-## Log System (v1.4)
+## Staging Architecture (v1.10)
+- **Separate Identity**: Test Bud has its own `SOUL.md`, `IDENTITY.md`, and `memory/` directory
+- **No Shared Memory**: Staging and live memory are completely independent
+- **Same Code, Different Personality**: Both instances run the same `claude.js` — differentiation comes from the personality/memory files in each instance's directory
+
+## Promotion Rules
+When promoting staging to live, the following are copied: `src/`, `skills/`, `config.json`, `package.json`, `watchdog.js`, and any other new files/directories.
+
+The following are **NEVER** promoted (each instance keeps its own):
+- `.env` — Different Discord tokens, API keys, WAKE_CHANNEL_ID
+- `SOUL.md` / `IDENTITY.md` — Live has its own personality
+- `memory/` — Each instance has completely separate memory
+- `logs/` — Each instance has its own logs
+- `node_modules/` / `package-lock.json` — Dependencies managed separately
+- `backups/` / `staging/` — Meta directories
+
+## Versioning
+- Version auto-increments from the last backup: v1.9 → v1.10 → v1.11 (not v2.0)
+- You can also specify a version manually: `promote` with `version: "v1.10"`
+- Use `dryRun: true` to preview what would be promoted
+
+## Log System (v1.4+)
 - Staging bot output → `staging/logs/staging.log`
 - Live bot output → `logs/live.log`
 - Logs persist across restarts (unlike in-memory buffer)
@@ -23,9 +45,10 @@ Manages child processes — primarily the staging/test bot, but also handles sel
 - Self-restart writes a signal file that the watchdog picks up
 - Watchdog handles rollback if the new version crashes on startup
 - Staging bot cannot manage processes (BOT_ROLE guard)
+- Promotion creates a timestamped backup before overwriting anything
 
 ## Architecture
 - Staging bot is spawned via `child_process.spawn('node', ['src/index.js'], { cwd: 'staging/' })`
+- Since cwd is `staging/`, all `path.resolve()` calls naturally find staging's own files
 - Self-restart writes `.restart-signal` file to project root, then the watchdog detects it
-- Watchdog backs up current live, promotes staging, and restarts
 - Watchdog pipes live bot output to `logs/live.log` AND terminal (tee pattern)

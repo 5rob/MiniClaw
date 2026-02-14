@@ -1,6 +1,7 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
-// v2.0 — Gemini Vision + Image Generation
+// v1.10 — Merged: wake-up (v1.3), auto-switch (v1.6), ack (v1.7), context wake-up (v1.8),
+//          heartbeat (v1.9), Gemini Vision + Image Generation (v2.0), creative tool use
 import { Client, GatewayIntentBits, Partials, ChannelType, AttachmentBuilder } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
@@ -37,13 +38,12 @@ function writeHeartbeat() {
 
 // --- Pending Image Attachments (v2.0) ---
 // When generate_image tool runs, it saves a file to temp/.
-// Claude's response will reference the file path. We detect these
-// and attach them to the Discord message.
+// We detect these and attach them to the Discord message.
 const TEMP_DIR = path.resolve('temp');
 
 /**
- * Extract image file paths from Claude's response text.
- * Looks for paths in temp/ directory that exist on disk.
+ * Extract image file paths from temp/ directory.
+ * Looks for recently generated images (within last 2 minutes).
  */
 function extractPendingImages() {
   if (!fs.existsSync(TEMP_DIR)) return [];
@@ -133,8 +133,8 @@ function autoSwitchModel(messageContent) {
   return label;
 }
 
-// --- Haiku Quick-Call Helper ---
-const haiku = new Anthropic();
+// --- Haiku Quick-Call Helper (shared by wake-up and ack) ---
+const haiku = new Anthropic(); // Uses ANTHROPIC_API_KEY from env
 
 async function haikuQuickCall(system, userContent, maxTokens = 100) {
   const response = await haiku.messages.create({
@@ -146,8 +146,14 @@ async function haikuQuickCall(system, userContent, maxTokens = 100) {
   return response.content[0]?.text?.trim() || null;
 }
 
+/**
+ * Gather context for the wake-up message (v1.8):
+ * - Recent daily log entries
+ * - Upgrade context file (if this is a post-promotion restart)
+ */
 function gatherWakeUpContext() {
   const context = { recentActivity: null, upgrade: null };
+
   try {
     const logs = loadRecentDailyLogs(1);
     if (logs.length > 0 && logs[0].content) {
@@ -158,6 +164,7 @@ function gatherWakeUpContext() {
   } catch (err) {
     console.error('[Discord] Failed to read daily logs for wake-up:', err.message);
   }
+
   try {
     const upgradeContextPath = path.resolve('.upgrade-context');
     if (fs.existsSync(upgradeContextPath)) {
@@ -169,40 +176,57 @@ function gatherWakeUpContext() {
   } catch (err) {
     console.error('[Discord] Failed to read upgrade context:', err.message);
   }
+
   return context;
 }
 
+/**
+ * Generate a context-aware wake-up message using a quick Haiku call.
+ * v1.8: Reads recent conversation and upgrade context.
+ */
 async function generateWakeUpMessage() {
   try {
     const context = gatherWakeUpContext();
+
     let contextBlock = '';
+
     if (context.upgrade) {
-      contextBlock += `\n\nUPGRADE CONTEXT: Just upgraded to version ${context.upgrade.version}. Files promoted: ${context.upgrade.promoted.join(', ')}.`;
+      contextBlock += `\n\nUPGRADE CONTEXT: Just upgraded to version ${context.upgrade.version}. Changes: ${context.upgrade.reason || 'No details provided.'}`;
     }
+
     if (context.recentActivity) {
-      contextBlock += `\n\nRECENT CONVERSATION (tail):\n${context.recentActivity}`;
+      contextBlock += `\n\nRECENT ACTIVITY (tail of today's log):\n${context.recentActivity}`;
     }
 
     const systemPrompt = `You are an AI assistant who just came back online after a restart. Generate a single short wake-up message (1-2 sentences max). Be witty, dry, and casual — not corporate or overly enthusiastic. You have personality: think dry humour, understated competence, maybe a little self-aware about being rebooted.
 
-IMPORTANT: You have context about what was happening before you restarted. Use it! Reference what you were working on, acknowledge the upgrade if there was one, or comment on the conversation. Don't be generic — show you remember.
+${context.upgrade ? 'You just got upgraded — reference what changed if it sounds interesting. Keep it brief.' : ''}
+${context.recentActivity ? 'You have context about what was happening before you went down. You can reference it naturally if relevant — like picking up a conversation. But keep it SHORT.' : ''}
 
-If there's upgrade context, acknowledge the new version naturally.
-If there's recent conversation context, reference what was being discussed or built.
-If there's both, blend them naturally.
-If there's neither, fall back to a generic but personality-filled message.
+Examples of the vibe (don't repeat these exactly, come up with something fresh):
+- "Back online. What'd I miss?"
+- "I'm here. Memory loaded, coffee pending."
+- "Rebooted. Still me — I checked."
+- "Woke up, read my diary. Caught up now."
+- "Back. Did you try turning me off and on again? ...oh wait."
 
-Keep it brief and natural. Just output the message, nothing else. No quotes, no preamble.`;
+Just output the message, nothing else. No quotes, no preamble.`;
 
     const userPrompt = contextBlock || 'No context available — generate a generic wake-up message.';
+
     const text = await haikuQuickCall(systemPrompt, userPrompt, 150);
     return text || "I'm back.";
   } catch (err) {
     console.error('[Discord] Failed to generate wake-up message:', err.message);
-    return "I'm back online.";
+    return "I'm back online."; // Fallback if API call fails
   }
 }
 
+/**
+ * Generate a quick acknowledgement message before a long operation (v1.7).
+ * Haiku decides if the message is a task (needs ack) or casual chat (no ack).
+ * Returns the ack string, or null if no ack is needed.
+ */
 async function generateAckMessage(userMessage) {
   try {
     const text = await haikuQuickCall(
@@ -224,24 +248,26 @@ Just output the ack message or SKIP, nothing else. No quotes, no preamble.`,
     return text;
   } catch (err) {
     console.error('[Discord] Failed to generate ack message:', err.message);
-    return null;
+    return null; // Fail silently — ack is optional
   }
 }
 
 export function startDiscord() {
   if (!process.env.DISCORD_TOKEN) {
     console.error('[Discord] ERROR: No DISCORD_TOKEN in .env file');
+    console.error('[Discord] Please add your Discord bot token to .env');
     process.exit(1);
   }
 
   if (!process.env.DISCORD_OWNER_ID) {
     console.error('[Discord] ERROR: No DISCORD_OWNER_ID in .env file');
+    console.error('[Discord] Please add your Discord user ID to .env');
     process.exit(1);
   }
 
   // v2.0: Log Gemini status on startup
   if (isGeminiEnabled()) {
-    console.log('[Discord] Gemini enabled (Vision + Image Generation) (v2.0)');
+    console.log('[Discord] Gemini enabled (Vision + Image Generation) (v1.10)');
   } else {
     console.log('[Discord] Gemini disabled — no GEMINI_API_KEY in .env');
   }
@@ -251,9 +277,12 @@ export function startDiscord() {
     console.log(`[Discord] Owner ID: ${process.env.DISCORD_OWNER_ID}`);
     console.log(`[Discord] Listening for messages...`);
 
+    // v1.9: Write heartbeat IMMEDIATELY — before any async work
     writeHeartbeat();
     console.log('[Discord] Heartbeat written');
 
+    // Send a context-aware wake-up message (async — can take a while)
+    // Uses WAKE_CHANNEL_ID from .env to know exactly where to post.
     setTimeout(async () => {
       try {
         const channelId = process.env.WAKE_CHANNEL_ID;
@@ -272,13 +301,17 @@ export function startDiscord() {
         console.log(`[Discord] Sent wake-up to #${channel.name}`);
       } catch (err) {
         console.error('[Discord] Error sending wake-up message:', err.message);
+        // Non-fatal — bot continues working even if wake-up fails
       }
-    }, 2000);
+    }, 2000); // 2 second delay for cache to populate
   });
 
   client.on('messageCreate', async (message) => {
     try {
+      // Ignore bots
       if (message.author.bot) return;
+
+      // SECURITY: Only respond to the owner
       if (message.author.id !== process.env.DISCORD_OWNER_ID) {
         console.log(`[Discord] Ignored message from non-owner: ${message.author.tag} (${message.author.id})`);
         return;
@@ -291,7 +324,7 @@ export function startDiscord() {
         const textExtensions = ['.txt', '.js', '.ts', '.json', '.py', '.md', '.csv', '.log'];
 
         for (const [, attachment] of message.attachments) {
-          // Text files
+          // Text files — read content
           const isTextFile = textExtensions.some(ext => attachment.name.endsWith(ext))
             || attachment.contentType?.startsWith('text/');
           if (isTextFile && attachment.size < 100_000) {
@@ -329,7 +362,7 @@ export function startDiscord() {
         }
       }
 
-      // Check embeds for images
+      // v2.0: Check embeds for images
       if (message.embeds.length > 0) {
         for (const embed of message.embeds) {
           const imageUrl = embed.image?.url || embed.thumbnail?.url;
@@ -344,6 +377,7 @@ export function startDiscord() {
         }
       }
 
+      // Now bail if there's truly nothing
       if (!content) return;
 
       // Handle special commands
@@ -353,26 +387,56 @@ export function startDiscord() {
         await message.reply(result);
         return;
       }
-      if (content === '!model') { await message.reply(`Current model: \`${getModel()}\``); return; }
+
+      if (content === '!model') {
+        await message.reply(`Current model: \`${getModel()}\``);
+        return;
+      }
+
       if (content === '!ping') {
         const startTime = Date.now();
         const msg = await message.reply('Pong!');
         await msg.edit(`Pong! Latency: ${Date.now() - startTime}ms`);
         return;
       }
+
       if (content === '!reindex') {
         await message.reply('Reindexing memory...');
-        try { await indexMemoryFiles(); await message.channel.send('✅ Memory index updated'); }
-        catch (err) { await message.channel.send(`❌ Reindexing failed: ${err.message}`); }
+        try {
+          await indexMemoryFiles();
+          await message.channel.send('✅ Memory index updated');
+        } catch (err) {
+          await message.channel.send(`❌ Reindexing failed: ${err.message}`);
+        }
         return;
       }
+
       if (content === '!clear') {
         clearHistory(message.channel.id);
         await message.reply('Conversation history cleared for this channel.');
         return;
       }
+
       if (content === '!help') {
-        const helpText = `**MiniClaw Commands**\n\n**Model Management:**\n\`!model\` — Show current model\n\`!model <model-id>\` — Switch to a different model\n\n**System:**\n\`!ping\` — Check bot latency\n\`!reindex\` — Rebuild memory search index\n\`!clear\` — Clear conversation history for this channel\n\`!help\` — Show this help message`;
+        const helpText = `**MiniClaw Commands**
+
+**Model Management:**
+\`!model\` — Show current model
+\`!model <model-id>\` — Switch to a different model
+
+**System:**
+\`!ping\` — Check bot latency
+\`!reindex\` — Rebuild memory search index
+\`!clear\` — Clear conversation history for this channel
+\`!help\` — Show this help message
+
+**Available Models:**
+• \`claude-sonnet-4-5-20250929\` — Sonnet 4.5 (balanced, default)
+• \`claude-haiku-4-5-20251001\` — Haiku 4.5 (fast & cheap)
+• \`claude-opus-4-6\` — Opus 4.6 (most capable)
+
+Just chat normally for AI assistance!`;
+
         await message.reply(helpText);
         return;
       }
@@ -391,7 +455,7 @@ export function startDiscord() {
       if (ackMessage) {
         const ackText = switchNotice ? switchNotice + ackMessage : ackMessage;
         await message.channel.send(ackText);
-        switchNotice = '';
+        switchNotice = ''; // Don't double-up the switch notice on the main response
         console.log(`[Discord] Ack sent: "${ackMessage}"`);
       }
 
@@ -408,70 +472,81 @@ export function startDiscord() {
       // Don't send empty messages
       if ((!response || response.trim().length === 0) && attachments.length === 0) {
         const reply = switchNotice
-          ? switchNotice + "✅ *(done — tools executed, no text response)*"
-          : "✅ *(done — tools executed, no text response)*";
+          ? switchNotice + '*(completed — no text response)*'
+          : '*(completed — no text response)*';
         await message.reply(reply);
         return;
       }
 
-      const fullResponse = switchNotice + (response || '');
+      // Split long responses (Discord 2000 char limit)
+      const maxLen = 1900; // Leave room for switch notice on first message
+      const fullResponse = switchNotice
+        ? switchNotice + response
+        : response;
+      const chunks = splitMessage(fullResponse, maxLen);
 
-      // Send with or without image attachments
-      if (fullResponse.length <= 2000) {
+      // Send first chunk as reply (with image attachments if any)
+      if (chunks.length > 0) {
+        const replyOptions = { content: chunks[0] };
         if (attachments.length > 0) {
-          await message.reply({ content: fullResponse || null, files: attachments });
-        } else {
-          await message.reply(fullResponse);
+          replyOptions.files = attachments;
         }
-      } else {
-        // Split long messages — attach images to the last chunk
-        const chunks = splitMessage(fullResponse, 2000);
-        for (let i = 0; i < chunks.length; i++) {
-          if (i === 0) {
-            await message.reply(chunks[i]);
-          } else if (i === chunks.length - 1 && attachments.length > 0) {
-            await message.channel.send({ content: chunks[i], files: attachments });
-          } else {
-            await message.channel.send(chunks[i]);
-          }
-        }
+        await message.reply(replyOptions);
       }
 
-      // Clean up temp files after sending
+      // Send remaining chunks as follow-up messages
+      for (let i = 1; i < chunks.length; i++) {
+        await message.channel.send(chunks[i]);
+      }
+
+      // Clean up sent images
       if (pendingImages.length > 0) {
         cleanupSentImages(pendingImages);
       }
 
+      // Write heartbeat after successful message processing
+      writeHeartbeat();
+
     } catch (err) {
       console.error('[Discord] Error handling message:', err);
       try {
-        const errorMsg = err.message.length > 500 ? err.message.slice(0, 500) + '...' : err.message;
-        await message.reply(`❌ Error: ${errorMsg}`);
+        await message.reply(`❌ Error: ${err.message}`);
       } catch (replyErr) {
-        console.error('[Discord] Failed to send error message:', replyErr);
+        console.error('[Discord] Failed to send error reply:', replyErr.message);
       }
     }
   });
 
-  client.on('error', (err) => console.error('[Discord] Client error:', err));
-  client.on('warn', (warn) => console.warn('[Discord] Client warning:', warn));
-
-  client.login(process.env.DISCORD_TOKEN).catch(err => {
-    console.error('[Discord] Login failed:', err.message);
-    process.exit(1);
-  });
+  // Login
+  client.login(process.env.DISCORD_TOKEN);
 }
 
-function splitMessage(text, maxLength) {
+/**
+ * Split a message into chunks at newline or space boundaries.
+ */
+function splitMessage(text, maxLength = 1900) {
+  if (text.length <= maxLength) return [text];
+
   const chunks = [];
   let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLength) { chunks.push(remaining); break; }
+
+  while (remaining.length > maxLength) {
+    // Find a good split point (newline or space)
     let splitAt = remaining.lastIndexOf('\n', maxLength);
-    if (splitAt === -1 || splitAt < maxLength / 2) splitAt = remaining.lastIndexOf(' ', maxLength);
-    if (splitAt === -1) splitAt = maxLength;
+    if (splitAt === -1 || splitAt < maxLength * 0.5) {
+      splitAt = remaining.lastIndexOf(' ', maxLength);
+    }
+    if (splitAt === -1 || splitAt < maxLength * 0.5) {
+      splitAt = maxLength; // Force split
+    }
+
     chunks.push(remaining.slice(0, splitAt));
     remaining = remaining.slice(splitAt).trimStart();
   }
+
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+
   return chunks;
 }

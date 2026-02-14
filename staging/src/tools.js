@@ -1,6 +1,6 @@
 // src/tools.js
 // Tool registry — loads built-in tools + custom skills
-// v2.0: Added generate_image tool (Gemini image generation)
+// v1.10: Added generate_image tool (Gemini image generation)
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
@@ -153,7 +153,7 @@ const builtInTools = [
   },
   {
     name: 'generate_image',
-    description: 'Generate an image using Gemini AI. Returns a file path that will be automatically attached to the Discord response. Use this when the user asks you to create, draw, generate, or make an image/picture/illustration.',
+    description: 'Generate an image using Gemini AI. Returns a file path that will be automatically attached to the Discord response. Use this when the user asks you to create, draw, generate, or make an image/picture/illustration. You can also use this proactively for visual humor, illustrating concepts, or creative expression.',
     input_schema: {
       type: 'object',
       properties: {
@@ -194,20 +194,21 @@ async function executeBuiltIn(name, input) {
       return { success: true, message: 'Daily log entry added.' };
 
     case 'memory_search': {
-      // Use hybrid BM25 + vector search if available, fall back to keyword
+      // Try hybrid search first, fall back to keyword search
       try {
         const { hybridSearch } = await import('./memory-index.js');
-        const results = await hybridSearch(input.query, cfg.memory?.searchMaxResults || 10);
-        return { results, searchType: 'hybrid' };
+        const results = await hybridSearch(input.query);
+        return { results };
       } catch (err) {
-        console.warn('[Tools] Hybrid search failed, using simple keyword search:', err.message);
+        // Hybrid search unavailable — fall back to basic keyword search
+        console.warn('[Tools] Hybrid search unavailable, using keyword fallback:', err.message);
         const results = memory.searchMemory(input.query);
-        return { results, searchType: 'keyword-only' };
+        return { results, note: 'Used keyword search (hybrid search unavailable)' };
       }
     }
 
     case 'calendar_list_events':
-      return { events: await calendar.listEvents(input) };
+      return await calendar.listEvents(input.maxResults, input.daysAhead);
 
     case 'calendar_create_event':
       return await calendar.createEvent(input);
@@ -215,52 +216,47 @@ async function executeBuiltIn(name, input) {
     case 'calendar_delete_event':
       return await calendar.deleteEvent(input.eventId);
 
-    case 'calendar_update_event': {
-      const { eventId, ...updates } = input;
-      const body = {};
-      if (updates.summary) body.summary = updates.summary;
-      if (updates.description) body.description = updates.description;
-      if (updates.location) body.location = updates.location;
-      if (updates.startTime) body.start = { dateTime: updates.startTime, timeZone: 'Australia/Sydney' };
-      if (updates.endTime) body.end = { dateTime: updates.endTime, timeZone: 'Australia/Sydney' };
-      return await calendar.updateEvent(eventId, body);
-    }
-
-    case 'skill_builder':
-      return await skillBuilder.execute(input);
+    case 'calendar_update_event':
+      return await calendar.updateEvent(input.eventId, input);
 
     case 'skill_execute': {
-      const { skillName, action, params } = input;
-      const skillPath = path.join(process.cwd(), 'skills', skillName, 'handler.js');
+      // Execute a custom skill handler
+      const skillName = input.skillName;
+      const skillDir = path.join(SKILLS_DIR, skillName);
+      const handlerPath = path.join(skillDir, 'handler.js');
+
+      if (!fs.existsSync(handlerPath)) {
+        return { error: `Skill "${skillName}" not found or has no handler.js` };
+      }
 
       try {
-        const fileUrl = pathToFileURL(skillPath).href;
-        const skillModule = await import(fileUrl);
-        const result = await skillModule.execute(action, params);
-        return { success: true, result };
+        const handlerUrl = `file:///${handlerPath.replace(/\\/g, '/')}?t=${Date.now()}`;
+        const mod = await import(handlerUrl);
+        if (mod.execute) {
+          return await mod.execute(input);
+        }
+        return { error: `Skill "${skillName}" handler has no execute function` };
       } catch (err) {
-        return { success: false, error: err.message };
+        return { error: `Skill execution failed: ${err.message}` };
       }
     }
 
     case 'model_switcher': {
       const MODEL_MAP = {
-        'opus': 'claude-opus-4-6',
-        'sonnet': 'claude-sonnet-4-5-20250929',
-        'haiku': 'claude-haiku-4-5-20251001'
+        opus: 'claude-opus-4-6',
+        sonnet: 'claude-sonnet-4-5-20250929',
+        haiku: 'claude-haiku-4-5-20251001'
       };
 
       if (input.action === 'current') {
         return { currentModel: getModel() };
       }
-
       if (input.action === 'list') {
-        return { availableModels: MODEL_MAP };
+        return { models: MODEL_MAP, currentModel: getModel() };
       }
-
       if (input.action === 'switch') {
         if (!input.modelName || !MODEL_MAP[input.modelName]) {
-          return { error: 'Invalid model. Use: opus, sonnet, or haiku' };
+          return { error: 'Invalid model name. Use: opus, sonnet, or haiku' };
         }
         const fullModelId = MODEL_MAP[input.modelName];
         const result = setModel(fullModelId);
@@ -275,10 +271,10 @@ async function executeBuiltIn(name, input) {
         return { error: 'Image generation unavailable — no GEMINI_API_KEY configured.' };
       }
       const result = await generateImage(input.prompt, input.aspectRatio || '1:1');
-      
+
       // Schedule cleanup of old temp files (non-blocking)
       setTimeout(() => cleanupTempFiles(), 5000);
-      
+
       return result;
     }
 
