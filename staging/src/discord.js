@@ -1,7 +1,8 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
-// v1.10 — Merged: wake-up (v1.3), auto-switch (v1.6), ack (v1.7), context wake-up (v1.8),
-//          heartbeat (v1.9), Gemini Vision + Image Generation (v2.0), creative tool use
+// v1.12 — Merged: wake-up (v1.3), auto-switch (v1.6), ack (v1.7), context wake-up (v1.8),
+//          heartbeat (v1.9), Gemini Vision + Image Generation (v2.0), creative tool use,
+//          reminders integration (v1.12)
 import { Client, GatewayIntentBits, Partials, ChannelType, AttachmentBuilder } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
@@ -252,6 +253,25 @@ Just output the ack message or SKIP, nothing else. No quotes, no preamble.`,
   }
 }
 
+// --- Reminders Integration (v1.12) ---
+async function initReminders() {
+  try {
+    const skillPath = path.resolve('skills/reminders/handler.js');
+    if (!fs.existsSync(skillPath)) {
+      console.log('[Discord] Reminders skill not found, skipping init');
+      return;
+    }
+    const remindersModule = await import(`file://${skillPath.replace(/\\/g, '/')}`);
+    if (remindersModule.init) {
+      await remindersModule.init(client);
+      console.log('[Discord] Reminders skill initialized ✅');
+    }
+  } catch (err) {
+    console.error('[Discord] Failed to initialize reminders skill:', err.message);
+    // Non-fatal — bot works without reminders
+  }
+}
+
 export function startDiscord() {
   if (!process.env.DISCORD_TOKEN) {
     console.error('[Discord] ERROR: No DISCORD_TOKEN in .env file');
@@ -280,6 +300,9 @@ export function startDiscord() {
     // v1.9: Write heartbeat IMMEDIATELY — before any async work
     writeHeartbeat();
     console.log('[Discord] Heartbeat written');
+
+    // v1.12: Initialize reminders background ticker
+    await initReminders();
 
     // Send a context-aware wake-up message (async — can take a while)
     // Uses WAKE_CHANNEL_ID from .env to know exactly where to post.
