@@ -1,7 +1,7 @@
 // promote.js — Auto-promotion from staging to live
-// Part of process-manager v1.11
+// Part of process-manager v1.12
 // Copies everything from staging/ to live EXCEPT protected paths.
-// This ensures nothing gets missed when new files/dirs are added to staging.
+// Preserves skill data/ folders (user content that lives only in each instance).
 import fs from 'fs';
 import path from 'path';
 
@@ -31,13 +31,96 @@ const NEVER_PROMOTE = new Set([
   '.git',             // Version control (if present)
 ]);
 
+// Folder names that should be preserved (not overwritten) inside skill directories.
+// These contain user/instance-specific content, not code.
+const SKILL_PROTECTED_FOLDERS = new Set([
+  'data',             // Skill data files (e.g. file-reader/data/ with user's .txt files)
+]);
+
 function shouldSkip(name) {
   return NEVER_PROMOTE.has(name);
 }
 
 /**
+ * Smart copy for the skills/ directory.
+ * Instead of nuking and replacing, merges at the skill level:
+ * - Code files (handler.js, SKILL.md, etc.) are overwritten
+ * - Protected folders (data/) in the destination are preserved
+ * - New skills from staging are copied entirely
+ * - Skills deleted in staging are removed from live
+ */
+function copySkillsDir(srcSkills, destSkills) {
+  fs.mkdirSync(destSkills, { recursive: true });
+  
+  const srcSkillNames = new Set(fs.readdirSync(srcSkills));
+  const destSkillNames = fs.existsSync(destSkills) 
+    ? new Set(fs.readdirSync(destSkills)) 
+    : new Set();
+  
+  // Remove skills from dest that don't exist in src (deleted skills)
+  for (const skillName of destSkillNames) {
+    if (!srcSkillNames.has(skillName)) {
+      const destPath = path.join(destSkills, skillName);
+      fs.rmSync(destPath, { recursive: true, force: true });
+    }
+  }
+  
+  // Copy/merge each skill from src to dest
+  for (const skillName of srcSkillNames) {
+    const srcSkill = path.join(srcSkills, skillName);
+    const destSkill = path.join(destSkills, skillName);
+    const srcStat = fs.statSync(srcSkill);
+    
+    if (!srcStat.isDirectory()) {
+      // Top-level file in skills/ (unlikely but handle it)
+      fs.copyFileSync(srcSkill, destSkill);
+      continue;
+    }
+    
+    // Merge this skill directory
+    fs.mkdirSync(destSkill, { recursive: true });
+    const entries = fs.readdirSync(srcSkill, { withFileTypes: true });
+    
+    // Track what src has so we can clean up removed files
+    const srcEntryNames = new Set(entries.map(e => e.name));
+    
+    // Remove dest entries that don't exist in src (except protected folders)
+    if (fs.existsSync(destSkill)) {
+      const destEntries = fs.readdirSync(destSkill, { withFileTypes: true });
+      for (const destEntry of destEntries) {
+        if (SKILL_PROTECTED_FOLDERS.has(destEntry.name)) continue; // Never delete protected
+        if (!srcEntryNames.has(destEntry.name)) {
+          const removePath = path.join(destSkill, destEntry.name);
+          fs.rmSync(removePath, { recursive: true, force: true });
+        }
+      }
+    }
+    
+    for (const entry of entries) {
+      const srcPath = path.join(srcSkill, entry.name);
+      const destPath = path.join(destSkill, entry.name);
+      
+      if (entry.isDirectory()) {
+        if (SKILL_PROTECTED_FOLDERS.has(entry.name)) {
+          // Protected folder — skip entirely, preserve destination's version
+          continue;
+        }
+        // Non-protected subdirectory — replace entirely
+        if (fs.existsSync(destPath)) {
+          fs.rmSync(destPath, { recursive: true, force: true });
+        }
+        fs.cpSync(srcPath, destPath, { recursive: true });
+      } else {
+        // Regular file — overwrite
+        fs.copyFileSync(srcPath, destPath);
+      }
+    }
+  }
+}
+
+/**
  * Recursively copy a directory, skipping top-level NEVER_PROMOTE entries.
- * For nested directories, copies everything (the skip is only at the staging root level).
+ * Uses smart merging for skills/ to preserve data folders.
  */
 function copyDirContents(src, dest, isRoot = false) {
   fs.mkdirSync(dest, { recursive: true });
@@ -51,7 +134,13 @@ function copyDirContents(src, dest, isRoot = false) {
     const destPath = path.join(dest, entry.name);
 
     if (entry.isDirectory()) {
-      // For directories: remove existing live version and replace entirely
+      // Special handling for skills/ — smart merge instead of nuke-and-replace
+      if (isRoot && entry.name === 'skills') {
+        copySkillsDir(srcPath, destPath);
+        continue;
+      }
+      
+      // For other directories: remove existing live version and replace entirely
       // This ensures deleted files in staging don't persist in live
       if (fs.existsSync(destPath)) {
         fs.rmSync(destPath, { recursive: true, force: true });
@@ -138,11 +227,12 @@ export function promote(input = {}) {
     return {
       success: true,
       dryRun: true,
-      message: 'Dry run — no changes made.',
+      message: 'Dry run — no changes made. Note: skills/*/data/ folders are preserved in live during promotion.',
       version,
       wouldPromote,
       wouldSkip,
-      neverPromote: [...NEVER_PROMOTE]
+      neverPromote: [...NEVER_PROMOTE],
+      protectedSkillFolders: [...SKILL_PROTECTED_FOLDERS]
     };
   }
 
@@ -171,7 +261,7 @@ export function promote(input = {}) {
     return { success: false, error: `Backup failed: ${err.message}`, backupDir };
   }
 
-  // Step 2: Copy staging files to live (skip protected paths)
+  // Step 2: Copy staging files to live (skip protected paths, smart-merge skills/)
   const promoted = [];
   try {
     copyDirContents(STAGING_DIR, PROJECT_ROOT, true);
@@ -218,7 +308,7 @@ export function promote(input = {}) {
 
   return {
     success: true,
-    message: `Promotion complete! ${promoted.length} paths updated from staging to live.`,
+    message: `Promotion complete! ${promoted.length} paths updated from staging to live. Skill data/ folders preserved.`,
     version,
     promoted,
     skipped: wouldSkip,

@@ -141,7 +141,7 @@ export async function chat(channelId, userMessage) {
     let messages = [...history];
     let response;
     let iterations = 0;
-    const MAX_ITERATIONS = 10; // Prevent infinite tool loops
+    const MAX_ITERATIONS = 30; // Prevent infinite tool loops
 
     // Tool use loop — keep going until Claude stops calling tools
     while (iterations < MAX_ITERATIONS) {

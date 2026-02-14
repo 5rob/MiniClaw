@@ -17,7 +17,7 @@ Manages child processes — primarily the staging/test bot (Test Bud), but also 
 - **No Shared Memory**: Staging and live memory are completely independent
 - **Same Code, Different Personality**: Both instances run the same `claude.js` — differentiation comes from the personality/memory files in each instance's directory
 
-## Promotion Rules
+## Promotion Rules (v1.12)
 When promoting staging to live, the following are copied: `src/`, `skills/`, `config.json`, `package.json`, `watchdog.js`, and any other new files/directories.
 
 The following are **NEVER** promoted or reverted (each instance keeps its own):
@@ -27,10 +27,19 @@ The following are **NEVER** promoted or reverted (each instance keeps its own):
 - `logs/` — Each instance has its own logs
 - `node_modules/` / `package-lock.json` — Dependencies managed separately
 - `backups/` / `staging/` — Meta directories
+- `data/` (root level) — Memory index database
+
+**Skill data/ folders are preserved** (v1.12+):
+- `skills/*/data/` folders are NEVER overwritten during promote or revert
+- This protects user content like file-reader's data files, skill-specific databases, etc.
+- Skill code files (handler.js, SKILL.md, PROGRESS.md, etc.) ARE updated normally
+- New skills are copied entirely (including their data/ if present in staging)
+- Deleted skills are removed entirely from the destination
 
 ## Revert (v1.11+)
 - Copies all promotable paths from live → staging
 - Same exclusion rules as promotion (instance-specific files stay untouched)
+- Same skill data/ protection (v1.12+)
 - Stops the staging bot first if running
 - Use `dryRun: true` to preview what would be copied
 - Use after a failed experiment to get a clean starting point
