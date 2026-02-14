@@ -6,7 +6,7 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 import * as memory from './memory.js';
 import * as calendar from './calendar.js';
-import * as skillBuilder from './skill-builder.js';
+import * as codeBuilder from './code-builder.js';
 import { setModel, getModel } from './claude.js';
 import { generateImage, cleanupTempFiles, isGeminiEnabled } from './gemini.js';
 
