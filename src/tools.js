@@ -266,6 +266,9 @@ async function executeBuiltIn(name, input) {
       return { error: 'Unknown action' };
     }
 
+    case 'code_builder':
+      return await codeBuilder.execute(input);
+
     case 'generate_image': {
       if (!isGeminiEnabled()) {
         return { error: 'Image generation unavailable — no GEMINI_API_KEY configured.' };

@@ -6,7 +6,7 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 import * as memory from './memory.js';
 import * as calendar from './calendar.js';
-import * as skillBuilder from './skill-builder.js';
+import * as codeBuilder from './code-builder.js';
 import { setModel, getModel } from './claude.js';
 import { generateImage, cleanupTempFiles, isGeminiEnabled } from './gemini.js';
 
@@ -170,8 +170,8 @@ const builtInTools = [
       required: ['prompt']
     }
   },
-  // Skill builder is a built-in tool (core feature)
-  skillBuilder.toolDefinition
+  // Code builder is a built-in tool (replaces skill_builder)
+  codeBuilder.toolDefinition
 ];
 
 // Execute a built-in tool
@@ -265,6 +265,9 @@ async function executeBuiltIn(name, input) {
 
       return { error: 'Unknown action' };
     }
+
+    case 'code_builder':
+      return await codeBuilder.execute(input);
 
     case 'generate_image': {
       if (!isGeminiEnabled()) {
