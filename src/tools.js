@@ -170,8 +170,8 @@ const builtInTools = [
       required: ['prompt']
     }
   },
-  // Skill builder is a built-in tool (core feature)
-  skillBuilder.toolDefinition
+  // Code builder is a built-in tool (replaces skill_builder)
+  codeBuilder.toolDefinition
 ];
 
 // Execute a built-in tool

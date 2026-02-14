@@ -60,3 +60,48 @@ Bot: [build completes] "Done! handler.js created, SKILL.md written. Cost: $0.04.
 - `staging/skills/<name>/CLAUDE.md` — Context file for Claude Code (can be deleted after)
 - `staging/skills/<name>/.build-prompt.md` — The full prompt used (for rebuilds)
 - `staging/logs/builds/<name>-<timestamp>.log` — Full build output
+
+
+# code-builder
+
+The unified skill management and building system. Replaces the old `skill_builder` tool.
+
+## What Changed
+The old `skill_builder` tried to write code directly through the API — often producing incomplete or buggy results. The new `code_builder` splits the work:
+- **Project management** (list, read, update) runs instantly via the bot
+- **Building new skills** generates a detailed prompt and delegates to Claude Code CLI, which can research, iterate, and validate its own code
+
+## Project Management Actions
+These run immediately — no Claude Code needed:
+- **list_projects** — Show all installed skills
+- **read_project** — Read a skill's handler.js, SKILL.md, PROGRESS.md
+- **read_file** — Read any file in a skill folder
+- **write_data_file** — Write to a skill's data/ directory
+- **update_handler** — Directly overwrite handler.js (for quick fixes)
+- **update_skill_md** — Update documentation
+- **update_progress** — Append to the dev log
+
+## Build Actions
+These delegate to Claude Code for high-quality results:
+- **generate_prompt** — Create a build spec (always present to Rob first)
+- **build** — Spawn Claude Code in staging/skills/
+- **build_status** — Check if a build is running
+- **cancel_build** — Kill a running build
+- **list_builds** — Show build history
+- **read_build_log** — Read build output
+- **rebuild** — Re-run with existing prompt
+- **update_prompt** — Modify the build spec
+
+## Typical Flow
+```
+Rob: "Build me a weather skill"
+→ generate_prompt (bot creates spec, shows to Rob)
+Rob: "Looks good, build it"
+→ build (spawns Claude Code in staging/skills/weather/)
+→ Claude Code builds, iterates, validates
+→ "Done! Want to test in staging?"
+Rob: "Yes"
+→ process_manager restart (staging bot picks up new skill)
+Rob: "Works great, promote it"
+→ process_manager promote
+```
