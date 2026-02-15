@@ -1,6 +1,7 @@
 // src/tools.js
 // Tool registry — loads built-in tools + custom skills
 // v1.10: Added generate_image tool (Gemini image generation)
+// v1.13: Fixed duplicate tool name bug — final dedup + concurrency guard
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
@@ -174,6 +175,9 @@ const builtInTools = [
   codeBuilder.toolDefinition
 ];
 
+// Build a set of built-in tool names for deduplication
+const builtInToolNames = new Set(builtInTools.map(t => t.name));
+
 // Execute a built-in tool
 async function executeBuiltIn(name, input) {
   const cfg = loadConfig();
@@ -290,6 +294,7 @@ async function executeBuiltIn(name, input) {
 async function loadCustomSkillsAsync() {
   const customTools = [];
   const customHandlers = {};
+  const seenNames = new Set();
 
   if (!fs.existsSync(SKILLS_DIR)) {
     return { customTools, customHandlers };
@@ -310,9 +315,24 @@ async function loadCustomSkillsAsync() {
         const mod = await import(handlerUrl);
 
         if (mod.toolDefinition && mod.execute) {
+          const toolName = mod.toolDefinition.name;
+
+          // Skip skills whose tool name collides with a built-in tool
+          if (builtInToolNames.has(toolName)) {
+            console.log(`[Skills] Skipping ${skillName} — tool name "${toolName}" already registered as built-in`);
+            continue;
+          }
+
+          // Skip duplicate custom skill names (shouldn't happen, but safety net)
+          if (seenNames.has(toolName)) {
+            console.log(`[Skills] Skipping duplicate ${skillName} — tool name "${toolName}" already loaded`);
+            continue;
+          }
+
+          seenNames.add(toolName);
           customTools.push(mod.toolDefinition);
-          customHandlers[mod.toolDefinition.name] = mod.execute;
-          console.log(`[Skills] Loaded: ${skillName} (${mod.toolDefinition.name})`);
+          customHandlers[toolName] = mod.execute;
+          console.log(`[Skills] Loaded: ${skillName} (${toolName})`);
         } else {
           console.warn(`[Skills] Invalid handler in ${skillName}: missing toolDefinition or execute`);
         }
@@ -327,13 +347,53 @@ async function loadCustomSkillsAsync() {
   return { customTools, customHandlers };
 }
 
-// Main export: get all tools and cache custom handlers
+// === Tool cache with concurrency guard ===
+// Prevents duplicate tool arrays when multiple messages arrive simultaneously
+let cachedTools = null;
 let cachedCustomHandlers = {};
+let loadingPromise = null;
 
 export async function getAllTools() {
-  const { customTools, customHandlers } = await loadCustomSkillsAsync();
-  cachedCustomHandlers = customHandlers;
-  return [...builtInTools, ...customTools];
+  // Return cached tools if available
+  if (cachedTools) return cachedTools;
+
+  // If another call is already loading, wait for it instead of loading in parallel
+  if (loadingPromise) return loadingPromise;
+
+  loadingPromise = (async () => {
+    try {
+      const { customTools, customHandlers } = await loadCustomSkillsAsync();
+      cachedCustomHandlers = customHandlers;
+
+      // Final deduplication — guarantees no duplicate names reach the API
+      // This is the last line of defense regardless of what loadCustomSkillsAsync does
+      const seen = new Set();
+      const deduped = [];
+      for (const tool of [...builtInTools, ...customTools]) {
+        if (!seen.has(tool.name)) {
+          seen.add(tool.name);
+          deduped.push(tool);
+        } else {
+          console.log(`[Tools] Final dedup: skipping duplicate tool name "${tool.name}"`);
+        }
+      }
+
+      cachedTools = deduped;
+      return cachedTools;
+    } finally {
+      loadingPromise = null;
+    }
+  })();
+
+  return loadingPromise;
+}
+
+// Force reload of custom skills (call after installing/updating a skill)
+export async function reloadTools() {
+  cachedTools = null;
+  cachedCustomHandlers = {};
+  loadingPromise = null;
+  return await getAllTools();
 }
 
 export async function executeTool(name, input) {

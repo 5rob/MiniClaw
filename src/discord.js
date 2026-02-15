@@ -1,12 +1,11 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
-// v1.10 — Merged: wake-up (v1.3), auto-switch (v1.6), ack (v1.7), context wake-up (v1.8),
-//          heartbeat (v1.9), Gemini Vision + Image Generation (v2.0), creative tool use
-import { Client, GatewayIntentBits, Partials, ChannelType, AttachmentBuilder } from 'discord.js';
+// v1.13 — Three-tier model routing (Haiku/Sonnet/Opus), manual switch commands, auto-reset after builds
+import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
 import { loadRecentDailyLogs } from './memory.js';
-import { isImageAttachment, getImageMimeType, describeImage, isGeminiEnabled } from './gemini.js';
+import { isGeminiEnabled } from './gemini.js';
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import path from 'path';
@@ -36,54 +35,14 @@ function writeHeartbeat() {
   }
 }
 
-// --- Pending Image Attachments (v2.0) ---
-// When generate_image tool runs, it saves a file to temp/.
-// We detect these and attach them to the Discord message.
-const TEMP_DIR = path.resolve('temp');
-
-/**
- * Extract image file paths from temp/ directory.
- * Looks for recently generated images (within last 2 minutes).
- */
-function extractPendingImages() {
-  if (!fs.existsSync(TEMP_DIR)) return [];
-
-  try {
-    const files = fs.readdirSync(TEMP_DIR);
-    return files
-      .filter(f => f.startsWith('generated_') && (f.endsWith('.png') || f.endsWith('.jpg')))
-      .map(f => path.join(TEMP_DIR, f))
-      .filter(f => {
-        // Only include files created in the last 2 minutes (current generation)
-        const stat = fs.statSync(f);
-        return (Date.now() - stat.mtimeMs) < 120000;
-      });
-  } catch (err) {
-    console.error('[Discord] Error scanning temp dir:', err.message);
-    return [];
-  }
-}
-
-/**
- * Clean up sent images from temp directory.
- */
-function cleanupSentImages(filePaths) {
-  for (const fp of filePaths) {
-    try {
-      if (fs.existsSync(fp)) fs.unlinkSync(fp);
-    } catch (err) {
-      console.error(`[Discord] Failed to clean up ${fp}:`, err.message);
-    }
-  }
-}
-
-// --- Auto Model Switching (v1.6) ---
+// --- Three-Tier Model Routing (v1.13) ---
 const MODELS = {
-  opus: 'claude-opus-4-6',
-  sonnet: 'claude-sonnet-4-5-20250929'
+  haiku: 'claude-haiku-4-5-20251001',
+  sonnet: 'claude-sonnet-4-5-20250929',
+  opus: 'claude-opus-4-6'
 };
 
-// Build-mode triggers
+// Messages that need Opus — building, coding, complex dev work
 const BUILD_TRIGGERS = [
   /\blet'?s\s+(build|work on|tackle|get to work|implement|get #?\d)/i,
   /\bcan (you|we)\s+(build|implement|create|write|code|develop|set up|upgrade)/i,
@@ -92,11 +51,37 @@ const BUILD_TRIGGERS = [
   /\btime to\s+(build|code|work)/i,
   /\blet'?s\s+do\s+(it|this|that)\b/i,
   /\blet'?s\s+get\s+#?\d/i,
+  /\bgenerate.+prompt/i,
+  /\bkick off.+(build|skill)/i,
 ];
 
-// Chat-mode triggers
+// Messages that need Sonnet — tool use, reasoning, questions needing memory/calendar/search
+const TOOL_TRIGGERS = [
+  // Calendar
+  /\b(calendar|schedule|appointment|event|meeting|what'?s on|free time|busy)\b/i,
+  /\b(remind|reminder|tomorrow|next week|this week)\b/i,
+  // Memory operations
+  /\b(remember|forget|what do you know|do you recall|you mentioned)\b/i,
+  /\b(save|store|write|update|note)\s+(this|that|it|down)\b/i,
+  // Search / research / web
+  /\b(search|look up|find|fetch|web|browse|research)\b/i,
+  // Image generation
+  /\b(generate|create|make|draw)\s+(an?\s+)?(image|picture|photo|art|illustration)\b/i,
+  // File operations
+  /\b(read|write|edit|create|delete|list)\s+(file|files|the file|my file)/i,
+  // Skill/tool management (non-build)
+  /\b(list|show|check|inspect)\s+(skills|tools|projects)/i,
+  // Process management
+  /\b(promote|restart|deploy|staging|status)\b/i,
+  // Questions that likely need memory search or reasoning
+  /\bwhat (did|was|were|is|are|has)\b.{10,}/i,
+  /\b(how|why|when|where)\b.{10,}\?$/i,
+  // Explicit tool requests
+  /\b(use|call|run|execute|invoke)\s+(the\s+)?\w+\s+tool\b/i,
+];
+
+// Wind-down triggers — switch back to Haiku
 const CHAT_TRIGGERS = [
-  /\bswitch\s+to\s+sonnet\b/i,
   /\bjust\s+chat/i,
   /\btake\s+a\s+break/i,
   /\bdone\s+(building|coding|working)/i,
@@ -104,33 +89,75 @@ const CHAT_TRIGGERS = [
   /\bwind\s+down/i,
   /\bthat'?s\s+(it|all)\s+for\s+(now|today|tonight)/i,
   /\bno\s+more\s+(building|coding|work)/i,
+  /\bswitch\s+to\s+haiku\b/i,
 ];
 
+// Build completion patterns — auto-reset from Opus to Haiku
+const BUILD_DONE_PATTERNS = [
+  /build\s+(is\s+)?(complete|done|finished|succeeded)/i,
+  /successfully\s+built/i,
+  /skill\s+(is\s+)?ready/i,
+  /deployed?\s+to\s+staging/i,
+  /promotion\s+(complete|done|succeeded)/i,
+  /want\s+to\s+test/i,
+];
+
+/**
+ * Detect which model tier a message needs.
+ * Returns 'opus', 'sonnet', 'haiku', or null (no change).
+ */
 function detectModelContext(messageContent) {
-  const currentModel = getModel();
-  if (currentModel !== MODELS.opus) {
-    for (const pattern of BUILD_TRIGGERS) {
-      if (pattern.test(messageContent)) return 'opus';
-    }
+  // Build triggers → Opus (highest priority)
+  for (const pattern of BUILD_TRIGGERS) {
+    if (pattern.test(messageContent)) return 'opus';
   }
-  if (currentModel !== MODELS.sonnet) {
-    for (const pattern of CHAT_TRIGGERS) {
-      if (pattern.test(messageContent)) return 'sonnet';
-    }
+
+  // Tool triggers → Sonnet
+  for (const pattern of TOOL_TRIGGERS) {
+    if (pattern.test(messageContent)) return 'sonnet';
   }
+
+  // Wind-down triggers → Haiku
+  for (const pattern of CHAT_TRIGGERS) {
+    if (pattern.test(messageContent)) return 'haiku';
+  }
+
+  // No trigger matched — return null (use current model, which defaults to Haiku)
   return null;
 }
 
+/**
+ * Apply auto model switch if context detection finds a trigger.
+ * Returns a string describing the switch, or null if no switch happened.
+ */
 function autoSwitchModel(messageContent) {
   const switchTo = detectModelContext(messageContent);
   if (!switchTo) return null;
+
   const modelId = MODELS[switchTo];
   const currentModel = getModel();
-  if (currentModel === modelId) return null;
+
+  if (currentModel === modelId) return null; // Already on the right model
+
   setModel(modelId);
   const label = switchTo.charAt(0).toUpperCase() + switchTo.slice(1);
-  console.log(`[AutoSwitch] Detected ${switchTo} mode — switched from ${currentModel} to ${modelId}`);
+  console.log(`[AutoSwitch] ${switchTo} mode — ${currentModel} → ${modelId}`);
   return label;
+}
+
+/**
+ * Check if a response indicates build completion. If so, auto-reset to Haiku.
+ */
+function checkBuildComplete(responseText) {
+  if (getModel() !== MODELS.opus) return;
+
+  for (const pattern of BUILD_DONE_PATTERNS) {
+    if (pattern.test(responseText)) {
+      setModel(MODELS.haiku);
+      console.log('[AutoSwitch] Build complete — returning to Haiku');
+      return;
+    }
+  }
 }
 
 // --- Haiku Quick-Call Helper (shared by wake-up and ack) ---
@@ -182,7 +209,6 @@ function gatherWakeUpContext() {
 
 /**
  * Generate a context-aware wake-up message using a quick Haiku call.
- * v1.8: Reads recent conversation and upgrade context.
  */
 async function generateWakeUpMessage() {
   try {
@@ -218,14 +244,13 @@ Just output the message, nothing else. No quotes, no preamble.`;
     return text || "I'm back.";
   } catch (err) {
     console.error('[Discord] Failed to generate wake-up message:', err.message);
-    return "I'm back online."; // Fallback if API call fails
+    return "I'm back online.";
   }
 }
 
 /**
  * Generate a quick acknowledgement message before a long operation (v1.7).
- * Haiku decides if the message is a task (needs ack) or casual chat (no ack).
- * Returns the ack string, or null if no ack is needed.
+ * Only used when model is Sonnet or Opus (Haiku responds fast enough to skip ack).
  */
 async function generateAckMessage(userMessage) {
   try {
@@ -248,9 +273,24 @@ Just output the ack message or SKIP, nothing else. No quotes, no preamble.`,
     return text;
   } catch (err) {
     console.error('[Discord] Failed to generate ack message:', err.message);
-    return null; // Fail silently — ack is optional
+    return null;
   }
 }
+
+// --- Image attachment cleanup helper (v2.0) ---
+function cleanupSentImages(filePaths) {
+  for (const fp of filePaths) {
+    try {
+      if (fs.existsSync(fp)) fs.unlinkSync(fp);
+    } catch (err) {
+      console.error(`[Discord] Failed to clean up ${fp}:`, err.message);
+    }
+  }
+}
+
+// Lazy import for image extraction (only if gemini is available)
+let extractPendingImages;
+let AttachmentBuilder;
 
 export function startDiscord() {
   if (!process.env.DISCORD_TOKEN) {
@@ -277,152 +317,103 @@ export function startDiscord() {
     console.log(`[Discord] Owner ID: ${process.env.DISCORD_OWNER_ID}`);
     console.log(`[Discord] Listening for messages...`);
 
-    // v1.9: Write heartbeat IMMEDIATELY — before any async work
+    // v1.9: Write heartbeat IMMEDIATELY
     writeHeartbeat();
     console.log('[Discord] Heartbeat written');
 
-    // Send a context-aware wake-up message (async — can take a while)
-    // Uses WAKE_CHANNEL_ID from .env to know exactly where to post.
-    setTimeout(async () => {
+    // Send a context-aware wake-up message
+    const wakeChannelId = process.env.WAKE_CHANNEL_ID;
+    if (wakeChannelId) {
       try {
-        const channelId = process.env.WAKE_CHANNEL_ID;
-        if (!channelId) {
-          console.log('[Discord] No WAKE_CHANNEL_ID set in .env, skipping wake-up message');
-          return;
+        const channel = await client.channels.fetch(wakeChannelId);
+        if (channel) {
+          const wakeMsg = await generateWakeUpMessage();
+          await channel.send(wakeMsg);
+          console.log(`[Discord] Wake-up message sent to #${channel.name || wakeChannelId}`);
         }
-        const channel = await client.channels.fetch(channelId);
-        if (!channel) {
-          console.warn(`[Discord] Wake-up channel ${channelId} not found`);
-          return;
-        }
-        const wakeUpMsg = await generateWakeUpMessage();
-        console.log(`[Discord] Wake-up message: "${wakeUpMsg}"`);
-        await channel.send(wakeUpMsg);
-        console.log(`[Discord] Sent wake-up to #${channel.name}`);
       } catch (err) {
-        console.error('[Discord] Error sending wake-up message:', err.message);
-        // Non-fatal — bot continues working even if wake-up fails
+        console.error('[Discord] Failed to send wake-up message:', err.message);
       }
-    }, 2000); // 2 second delay for cache to populate
+    }
   });
 
   client.on('messageCreate', async (message) => {
-    try {
-      // Ignore bots
-      if (message.author.bot) return;
+    // Ignore bots and non-owner messages
+    if (message.author.bot) return;
+    if (message.author.id !== process.env.DISCORD_OWNER_ID) return;
 
-      // SECURITY: Only respond to the owner
-      if (message.author.id !== process.env.DISCORD_OWNER_ID) {
-        console.log(`[Discord] Ignored message from non-owner: ${message.author.tag} (${message.author.id})`);
-        return;
-      }
+    // Update heartbeat on every message
+    writeHeartbeat();
 
-      let content = message.content.trim();
+    const content = message.content.trim();
+    if (!content) return;
 
-      // --- Attachment Processing ---
-      if (message.attachments.size > 0) {
-        const textExtensions = ['.txt', '.js', '.ts', '.json', '.py', '.md', '.csv', '.log'];
+    // --- Command handling ---
 
-        for (const [, attachment] of message.attachments) {
-          // Text files — read content
-          const isTextFile = textExtensions.some(ext => attachment.name.endsWith(ext))
-            || attachment.contentType?.startsWith('text/');
-          if (isTextFile && attachment.size < 100_000) {
-            try {
-              const response = await fetch(attachment.url);
-              const text = await response.text();
-              content += (content ? '\n' : '') + text;
-              console.log(`[Discord] Read text attachment: ${attachment.name} (${attachment.size} bytes)`);
-            } catch (err) {
-              console.error(`[Discord] Failed to fetch attachment ${attachment.name}:`, err);
-            }
-            continue;
-          }
+    // Quick model switch commands (v1.13)
+    if (content === '!haiku') {
+      setModel(MODELS.haiku);
+      await message.reply('Switched to **Haiku** ⚡ (fast & cheap chat mode — no tools)');
+      return;
+    }
+    if (content === '!sonnet') {
+      setModel(MODELS.sonnet);
+      await message.reply('Switched to **Sonnet** 🎵 (balanced, tool-capable)');
+      return;
+    }
+    if (content === '!opus') {
+      setModel(MODELS.opus);
+      await message.reply('Switched to **Opus** 🔥 (full power, build mode)');
+      return;
+    }
 
-          // v2.0: Image files → describe with Gemini Vision
-          if (isImageAttachment(attachment)) {
-            if (attachment.size > 10_000_000) {
-              console.log(`[Vision] Skipping oversized image: ${attachment.name} (${(attachment.size / 1_000_000).toFixed(1)}MB)`);
-              content += (content ? '\n' : '') + `[Image: ${attachment.name} — too large to process]`;
-              continue;
-            }
-
-            const mimeType = getImageMimeType(attachment);
-            console.log(`[Vision] Processing image: ${attachment.name} (${mimeType}, ${(attachment.size / 1024).toFixed(0)}KB)`);
-
-            const description = await describeImage(attachment.url, mimeType);
-            if (description) {
-              content += (content ? '\n' : '') + `[Image: ${attachment.name} — ${description}]`;
-              console.log(`[Vision] Injected description for ${attachment.name}`);
-            } else {
-              content += (content ? '\n' : '') + `[Image: ${attachment.name} — could not describe]`;
-              console.log(`[Vision] Failed to describe ${attachment.name}`);
-            }
-          }
-        }
-      }
-
-      // v2.0: Check embeds for images
-      if (message.embeds.length > 0) {
-        for (const embed of message.embeds) {
-          const imageUrl = embed.image?.url || embed.thumbnail?.url;
-          if (imageUrl) {
-            console.log(`[Vision] Processing embedded image: ${imageUrl}`);
-            const description = await describeImage(imageUrl, 'image/png');
-            if (description) {
-              content += (content ? '\n' : '') + `[Embedded image: ${description}]`;
-              console.log(`[Vision] Injected description for embed`);
-            }
-          }
-        }
-      }
-
-      // Now bail if there's truly nothing
-      if (!content) return;
-
-      // Handle special commands
-      if (content.startsWith('!model ')) {
-        const newModel = content.slice(7).trim();
-        const result = setModel(newModel);
-        await message.reply(result);
-        return;
-      }
-
-      if (content === '!model') {
+    if (content.startsWith('!model')) {
+      const parts = content.split(/\s+/);
+      if (parts.length === 1) {
         await message.reply(`Current model: \`${getModel()}\``);
-        return;
+      } else {
+        const newModel = parts[1];
+        setModel(newModel);
+        await message.reply(`Model set to: \`${newModel}\``);
       }
+      return;
+    }
 
-      if (content === '!ping') {
-        const startTime = Date.now();
-        const msg = await message.reply('Pong!');
-        await msg.edit(`Pong! Latency: ${Date.now() - startTime}ms`);
-        return;
+    if (content === '!ping') {
+      const startTime = Date.now();
+      const msg = await message.reply('Pong!');
+      await msg.edit(`Pong! Latency: ${Date.now() - startTime}ms`);
+      return;
+    }
+
+    if (content === '!reindex') {
+      await message.reply('Reindexing memory...');
+      try {
+        await indexMemoryFiles();
+        await message.channel.send('✅ Memory index updated');
+      } catch (err) {
+        await message.channel.send(`❌ Reindexing failed: ${err.message}`);
       }
+      return;
+    }
 
-      if (content === '!reindex') {
-        await message.reply('Reindexing memory...');
-        try {
-          await indexMemoryFiles();
-          await message.channel.send('✅ Memory index updated');
-        } catch (err) {
-          await message.channel.send(`❌ Reindexing failed: ${err.message}`);
-        }
-        return;
-      }
+    if (content === '!clear') {
+      clearHistory(message.channel.id);
+      await message.reply('Conversation history cleared for this channel.');
+      return;
+    }
 
-      if (content === '!clear') {
-        clearHistory(message.channel.id);
-        await message.reply('Conversation history cleared for this channel.');
-        return;
-      }
+    if (content === '!help') {
+      const helpText = `**MiniClaw Commands**
 
-      if (content === '!help') {
-        const helpText = `**MiniClaw Commands**
+**Quick Model Switch:**
+\`!haiku\` — Fast & cheap chat mode (no tools)
+\`!sonnet\` — Balanced mode with tools
+\`!opus\` — Full power build mode
 
 **Model Management:**
 \`!model\` — Show current model
-\`!model <model-id>\` — Switch to a different model
+\`!model <model-id>\` — Switch to a specific model ID
 
 **System:**
 \`!ping\` — Check bot latency
@@ -430,44 +421,66 @@ export function startDiscord() {
 \`!clear\` — Clear conversation history for this channel
 \`!help\` — Show this help message
 
-**Available Models:**
-• \`claude-sonnet-4-5-20250929\` — Sonnet 4.5 (balanced, default)
-• \`claude-haiku-4-5-20251001\` — Haiku 4.5 (fast & cheap)
-• \`claude-opus-4-6\` — Opus 4.6 (most capable)
+**Auto-routing:** Messages are automatically routed to the right model tier based on content. Build requests → Opus, tool-needing tasks → Sonnet, casual chat → Haiku.`;
 
-Just chat normally for AI assistance!`;
+      await message.reply(helpText);
+      return;
+    }
 
-        await message.reply(helpText);
-        return;
-      }
+    // --- Auto Model Switching (v1.13: three-tier) ---
+    const switchResult = autoSwitchModel(content);
+    let switchNotice = '';
+    if (switchResult) {
+      switchNotice = `⚡ *Auto-switched to ${switchResult}*\n\n`;
+    }
 
-      // --- Auto Model Switching (v1.6) ---
-      const switchResult = autoSwitchModel(content);
-      let switchNotice = '';
-      if (switchResult) {
-        switchNotice = `⚡ *Auto-switched to ${switchResult}*\n\n`;
-      }
+    // --- Task Acknowledgement (v1.7) ---
+    // Only send ack for Sonnet/Opus — Haiku is fast enough to skip it
+    const currentModel = getModel();
+    const isHaiku = currentModel === MODELS.haiku || currentModel.includes('haiku');
+    let ackMessage = null;
 
-      // --- Task Acknowledgement (v1.7) ---
+    if (!isHaiku) {
       const ackPromise = generateAckMessage(content);
       await message.channel.sendTyping();
-      const ackMessage = await ackPromise;
+      ackMessage = await ackPromise;
       if (ackMessage) {
         const ackText = switchNotice ? switchNotice + ackMessage : ackMessage;
         await message.channel.send(ackText);
-        switchNotice = ''; // Don't double-up the switch notice on the main response
+        switchNotice = '';
         console.log(`[Discord] Ack sent: "${ackMessage}"`);
       }
+    }
 
+    // Send typing indicator (always, even for Haiku)
+    if (isHaiku || !ackMessage) {
+      await message.channel.sendTyping();
+    }
+
+    try {
       // Get response from Claude
       const response = await chat(message.channel.id, content);
 
-      // --- v2.0: Check for generated images to attach ---
-      const pendingImages = extractPendingImages();
-      const attachments = pendingImages.map(fp => {
-        const filename = path.basename(fp);
-        return new AttachmentBuilder(fp, { name: filename });
-      });
+      // v1.13: Check if build is complete — auto-reset to Haiku
+      checkBuildComplete(response || '');
+
+      // v2.0: Check for generated images to attach
+      let attachments = [];
+      try {
+        if (!extractPendingImages) {
+          const gemini = await import('./gemini.js');
+          extractPendingImages = gemini.extractPendingImages || (() => []);
+          const djs = await import('discord.js');
+          AttachmentBuilder = djs.AttachmentBuilder;
+        }
+        const pendingImages = extractPendingImages();
+        attachments = pendingImages.map(fp => {
+          const filename = path.basename(fp);
+          return new AttachmentBuilder(fp, { name: filename });
+        });
+      } catch (e) {
+        // Gemini not available, no images
+      }
 
       // Don't send empty messages
       if ((!response || response.trim().length === 0) && attachments.length === 0) {
@@ -479,73 +492,61 @@ Just chat normally for AI assistance!`;
       }
 
       // Split long responses (Discord 2000 char limit)
-      const maxLen = 1900; // Leave room for switch notice on first message
+      const maxLen = 1900;
       const fullResponse = switchNotice
         ? switchNotice + response
         : response;
-      const chunks = splitMessage(fullResponse, maxLen);
 
-      // Send first chunk as reply (with image attachments if any)
-      if (chunks.length > 0) {
-        const replyOptions = { content: chunks[0] };
-        if (attachments.length > 0) {
-          replyOptions.files = attachments;
+      if (fullResponse.length <= maxLen && attachments.length === 0) {
+        await message.reply(fullResponse);
+      } else if (fullResponse.length <= maxLen) {
+        await message.reply({ content: fullResponse, files: attachments });
+        cleanupSentImages(attachments.map(a => a.attachment || ''));
+      } else {
+        const chunks = splitMessage(fullResponse, maxLen);
+        for (let i = 0; i < chunks.length; i++) {
+          if (i === 0 && attachments.length > 0) {
+            await message.reply({ content: chunks[i], files: attachments });
+            cleanupSentImages(attachments.map(a => a.attachment || ''));
+          } else if (i === 0) {
+            await message.reply(chunks[i]);
+          } else {
+            await message.channel.send(chunks[i]);
+          }
         }
-        await message.reply(replyOptions);
       }
-
-      // Send remaining chunks as follow-up messages
-      for (let i = 1; i < chunks.length; i++) {
-        await message.channel.send(chunks[i]);
-      }
-
-      // Clean up sent images
-      if (pendingImages.length > 0) {
-        cleanupSentImages(pendingImages);
-      }
-
-      // Write heartbeat after successful message processing
-      writeHeartbeat();
-
     } catch (err) {
-      console.error('[Discord] Error handling message:', err);
-      try {
-        await message.reply(`❌ Error: ${err.message}`);
-      } catch (replyErr) {
-        console.error('[Discord] Failed to send error reply:', replyErr.message);
-      }
+      console.error('[Discord] Error:', err);
+      const errorMsg = switchNotice
+        ? switchNotice + `Error: ${err.message}`
+        : `Error: ${err.message}`;
+      await message.reply(errorMsg);
     }
   });
 
-  // Login
   client.login(process.env.DISCORD_TOKEN);
 }
 
-/**
- * Split a message into chunks at newline or space boundaries.
- */
-function splitMessage(text, maxLength = 1900) {
-  if (text.length <= maxLength) return [text];
-
+function splitMessage(text, maxLength) {
   const chunks = [];
   let remaining = text;
 
-  while (remaining.length > maxLength) {
-    // Find a good split point (newline or space)
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining);
+      break;
+    }
+
     let splitAt = remaining.lastIndexOf('\n', maxLength);
-    if (splitAt === -1 || splitAt < maxLength * 0.5) {
+    if (splitAt === -1 || splitAt < maxLength / 2) {
       splitAt = remaining.lastIndexOf(' ', maxLength);
     }
-    if (splitAt === -1 || splitAt < maxLength * 0.5) {
-      splitAt = maxLength; // Force split
+    if (splitAt === -1) {
+      splitAt = maxLength;
     }
 
     chunks.push(remaining.slice(0, splitAt));
     remaining = remaining.slice(splitAt).trimStart();
-  }
-
-  if (remaining.length > 0) {
-    chunks.push(remaining);
   }
 
   return chunks;

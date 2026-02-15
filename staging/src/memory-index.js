@@ -1,6 +1,7 @@
 // src/memory-index.js
 // Hybrid BM25 + Vector search over memory files, OpenClaw-style
 // Gracefully degrades to keyword-only if no embeddings available
+// v1.13: Added debounced re-indexing (markDirty + startPeriodicReindex)
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
@@ -11,6 +12,11 @@ const MEMORY_DIR = path.resolve('memory');
 
 let db = null;
 let config = null;
+
+// --- Debounced re-indexing ---
+let reindexTimer = null;
+let reindexDirty = false;
+const REINDEX_DEBOUNCE_MS = 30000; // 30 seconds
 
 export function initMemoryIndex() {
   try {
@@ -236,6 +242,43 @@ export async function indexMemoryFiles() {
     console.error('[MemoryIndex] Indexing error:', err.message);
     throw err;
   }
+}
+
+// --- Debounced Re-indexing ---
+
+// Mark the index as needing a refresh (called after memory writes)
+export function markDirty() {
+  reindexDirty = true;
+
+  // If no timer is running, start one
+  if (!reindexTimer) {
+    reindexTimer = setTimeout(async () => {
+      reindexTimer = null;
+      if (reindexDirty) {
+        reindexDirty = false;
+        console.log('[MemoryIndex] Debounced re-index triggered');
+        try {
+          await indexMemoryFiles();
+        } catch (err) {
+          console.error('[MemoryIndex] Debounced re-index failed:', err.message);
+        }
+      }
+    }, REINDEX_DEBOUNCE_MS);
+  }
+}
+
+// Start a periodic re-index interval (call once at startup)
+export function startPeriodicReindex(intervalMs = 300000) {
+  // Default: every 5 minutes, like OpenClaw's QMD backend
+  setInterval(async () => {
+    console.log('[MemoryIndex] Periodic re-index');
+    try {
+      await indexMemoryFiles();
+    } catch (err) {
+      console.error('[MemoryIndex] Periodic re-index failed:', err.message);
+    }
+  }, intervalMs);
+  console.log(`[MemoryIndex] Periodic re-index every ${intervalMs / 1000}s`);
 }
 
 // --- Hybrid Search (BM25 + Vector with RRF fusion) ---

@@ -1,18 +1,15 @@
-// src/code-builder.js
-// Replaces skill-builder.js — handles both project management AND Claude Code builds
-// v2.0 — Merged skill_builder actions + Claude Code delegation
+// skills/code-builder/handler.js
+// Delegates skill/tool building to Claude Code CLI for higher-quality results
+// v1.0 — Initial build: prompt generation + Claude Code spawning
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 const PROJECT_ROOT = process.cwd();
-const SKILLS_DIR = path.resolve('skills');
 const STAGING_DIR = path.join(PROJECT_ROOT, 'staging');
 const STAGING_SKILLS_DIR = path.join(STAGING_DIR, 'skills');
 const BUILD_LOG_DIR = path.join(STAGING_DIR, 'logs', 'builds');
 const IS_STAGING = process.env.BOT_ROLE === 'staging';
-
-fs.mkdirSync(SKILLS_DIR, { recursive: true });
 
 // Track active builds so we don't stack them
 let activeBuild = null;
@@ -31,126 +28,9 @@ function isoTimestamp() {
   return new Date().toISOString();
 }
 
-// ============================================================
-// PROJECT MANAGEMENT ACTIONS (migrated from skill-builder.js)
-// ============================================================
-
-function listProjects() {
-  if (!fs.existsSync(SKILLS_DIR)) return { projects: [] };
-
-  const projects = fs.readdirSync(SKILLS_DIR)
-    .filter(d => fs.statSync(path.join(SKILLS_DIR, d)).isDirectory())
-    .map(name => {
-      const progressPath = path.join(SKILLS_DIR, name, 'PROGRESS.md');
-      const hasHandler = fs.existsSync(path.join(SKILLS_DIR, name, 'handler.js'));
-      const progress = fs.existsSync(progressPath)
-        ? fs.readFileSync(progressPath, 'utf-8')
-        : '(no progress file)';
-
-      return {
-        name,
-        hasHandler,
-        latestProgress: progress.slice(-500)
-      };
-    });
-
-  return { projects };
-}
-
-function readProject(input) {
-  const { skillName } = input;
-  if (!skillName) throw new Error('skillName required');
-
-  const skillDir = path.join(SKILLS_DIR, skillName);
-  if (!fs.existsSync(skillDir)) {
-    throw new Error(`Skill "${skillName}" not found`);
-  }
-
-  const files = {};
-  for (const file of ['SKILL.md', 'handler.js', 'PROGRESS.md']) {
-    const p = path.join(skillDir, file);
-    files[file] = fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : null;
-  }
-
-  // List data files
-  const dataDir = path.join(skillDir, 'data');
-  files.dataFiles = fs.existsSync(dataDir) ? fs.readdirSync(dataDir) : [];
-
-  return files;
-}
-
-function readFile(input) {
-  const { skillName, fileName } = input;
-  if (!skillName || !fileName) throw new Error('skillName and fileName required');
-
-  const filePath = path.join(SKILLS_DIR, skillName, fileName);
-  if (!fs.existsSync(filePath)) {
-    throw new Error(`File not found: ${fileName}`);
-  }
-
-  return { content: fs.readFileSync(filePath, 'utf-8') };
-}
-
-function writeDataFile(input) {
-  const { skillName, fileName, content } = input;
-  if (!skillName || !fileName || content === undefined) {
-    throw new Error('skillName, fileName, and content required');
-  }
-
-  const filePath = path.join(SKILLS_DIR, skillName, 'data', fileName);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, content);
-
-  return { success: true, message: `Data file written: ${fileName}` };
-}
-
-function updateHandler(input) {
-  const { skillName, content } = input;
-  if (!skillName || !content) throw new Error('skillName and content required');
-
-  const handlerPath = path.join(SKILLS_DIR, skillName, 'handler.js');
-  if (!fs.existsSync(path.join(SKILLS_DIR, skillName))) {
-    throw new Error(`Skill "${skillName}" not found`);
-  }
-
-  fs.writeFileSync(handlerPath, content);
-  return { success: true, message: `handler.js updated for "${skillName}"` };
-}
-
-function updateSkillMd(input) {
-  const { skillName, content } = input;
-  if (!skillName || !content) throw new Error('skillName and content required');
-
-  const skillMdPath = path.join(SKILLS_DIR, skillName, 'SKILL.md');
-  if (!fs.existsSync(path.join(SKILLS_DIR, skillName))) {
-    throw new Error(`Skill "${skillName}" not found`);
-  }
-
-  fs.writeFileSync(skillMdPath, content);
-  return { success: true, message: `SKILL.md updated for "${skillName}"` };
-}
-
-function updateProgress(input) {
-  const { skillName, content } = input;
-  if (!skillName || !content) throw new Error('skillName and content required');
-
-  const progressPath = path.join(SKILLS_DIR, skillName, 'PROGRESS.md');
-  if (!fs.existsSync(path.join(SKILLS_DIR, skillName))) {
-    throw new Error(`Skill "${skillName}" not found`);
-  }
-
-  const now = isoTimestamp();
-  fs.appendFileSync(progressPath, `\n## ${now}\n${content}\n`);
-  return { success: true, message: `Progress updated for "${skillName}"` };
-}
-
-
-// ============================================================
-// CLAUDE CODE BUILD ACTIONS (new)
-// ============================================================
-
 // --- Action: generate_prompt ---
 // Creates a detailed build prompt and CLAUDE.md for Claude Code to follow.
+// Returns the prompt for Rob to review before kicking off the build.
 function generatePrompt(input) {
   const { skillName, description, requirements, examplePhrases, dataNeeds, existingCode } = input;
 
@@ -218,7 +98,11 @@ export async function execute(input) {
 }
 \`\`\`
 
-${requirements ? `## Specific Requirements\n${requirements}\n` : ''}${examplePhrases ? `## Example Trigger Phrases\nThese are the kinds of things the user might say that should activate this tool:\n${examplePhrases.map(p => `- "${p}"`).join('\n')}\n` : ''}${dataNeeds ? `## Data Storage Notes\n${dataNeeds}\n` : ''}${existingCode ? `## Existing Code to Build On\n\`\`\`javascript\n${existingCode}\n\`\`\`\n` : ''}
+${requirements ? `## Specific Requirements\n${requirements}\n` : ''}
+${examplePhrases ? `## Example Trigger Phrases\nThese are the kinds of things the user might say that should activate this tool:\n${examplePhrases.map(p => `- "${p}"`).join('\n')}\n` : ''}
+${dataNeeds ? `## Data Storage Notes\n${dataNeeds}\n` : ''}
+${existingCode ? `## Existing Code to Build On\n\`\`\`javascript\n${existingCode}\n\`\`\`\n` : ''}
+
 ## What to Build
 1. Create \`handler.js\` with the full working implementation
 2. Create \`SKILL.md\` with clear documentation
@@ -233,7 +117,7 @@ ${requirements ? `## Specific Requirements\n${requirements}\n` : ''}${examplePhr
 - Test your logic mentally — walk through the execute() function with sample inputs.
 `;
 
-  // Write CLAUDE.md so Claude Code has project context
+  // Write CLAUDE.md to the staging skills dir so Claude Code has project context
   const claudeMd = `# MiniClaw Skill Builder Context
 
 You are building a skill for MiniClaw, a Discord bot that uses the Anthropic API with tool_use.
@@ -257,12 +141,16 @@ You are building a skill for MiniClaw, a Discord bot that uses the Anthropic API
 - Use require() — this project uses ES modules
 `;
 
-  fs.writeFileSync(path.join(skillDir, 'CLAUDE.md'), claudeMd);
-  fs.writeFileSync(path.join(skillDir, '.build-prompt.md'), buildPrompt);
+  const claudeMdPath = path.join(skillDir, 'CLAUDE.md');
+  fs.writeFileSync(claudeMdPath, claudeMd);
+
+  // Also save the full build prompt for reference
+  const promptPath = path.join(skillDir, '.build-prompt.md');
+  fs.writeFileSync(promptPath, buildPrompt);
 
   return {
     success: true,
-    message: `Build prompt generated for "${skillName}". Review it and use action "build" to kick off Claude Code, or adjust with "update_prompt" first.`,
+    message: `Build prompt generated for "${skillName}". Review it and use action "build" to kick off Claude Code, or "build_auto" to start immediately.`,
     skillName,
     skillDir,
     promptPreview: buildPrompt.slice(0, 1500) + '\n\n... (truncated, full prompt saved to .build-prompt.md)',
@@ -271,6 +159,7 @@ You are building a skill for MiniClaw, a Discord bot that uses the Anthropic API
 }
 
 // --- Action: build ---
+// Spawns Claude Code CLI to actually build the skill in the staging directory.
 function build(input) {
   return new Promise((resolve) => {
     const { skillName, maxTurns } = input;
@@ -304,12 +193,14 @@ function build(input) {
     const logFile = path.join(BUILD_LOG_DIR, `${skillName}-${Date.now()}.log`);
     ensureDir(BUILD_LOG_DIR);
 
+    // Determine max turns for Claude Code (default 30, good balance of thoroughness)
     const turns = maxTurns || 30;
 
+    // Build the claude command
+    // Uses -p for non-interactive mode, --output-format json for structured results
     const args = [
       '-p',
-      '--verbose',
-      '--output-format', 'stream-json',
+      '--output-format', 'json',
       '--max-turns', turns.toString(),
       '--allowedTools', 'Read,Write,Edit,Bash(node *),Bash(ls *),Bash(cat *),Bash(mkdir *),Bash(echo *),Bash(test *)',
     ];
@@ -317,19 +208,22 @@ function build(input) {
     let stdout = '';
     let stderr = '';
     const buildLog = [];
+
     const startTime = Date.now();
 
     try {
+      // Spawn Claude Code with the build prompt piped via stdin
       const proc = spawn('claude', args, {
         cwd: skillDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: {
           ...process.env,
           ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+          // Force no color for clean log output
           FORCE_COLOR: '0',
           NO_COLOR: '1'
         },
-        shell: true
+        shell: true // Required on Windows for PATH resolution
       });
 
       activeBuild = {
@@ -340,65 +234,23 @@ function build(input) {
         process: proc
       };
 
-      const addLog = (source, line) => {
-        const entry = `[${timestamp()}] [${source}] ${line}`;
-        buildLog.push(entry);
-        fs.appendFileSync(logFile, entry + '\n');
-        if (source === 'stderr') {
-          console.error(`[CodeBuilder:${skillName}] ${line}`);
-        } else {
-          console.log(`[CodeBuilder:${skillName}] ${line}`);
+      const addLog = (source, data) => {
+        const lines = data.toString().trim().split('\n');
+        for (const line of lines) {
+          const entry = `[${timestamp()}] [${source}] ${line}`;
+          buildLog.push(entry);
+          fs.appendFileSync(logFile, entry + '\n');
         }
       };
 
-      // stream-json sends newline-delimited JSON objects on stdout
-      // We parse each line to extract readable progress info
-      let stdoutBuffer = '';
-
       proc.stdout.on('data', (data) => {
         stdout += data.toString();
-        stdoutBuffer += data.toString();
-
-        // Process complete lines
-        const lines = stdoutBuffer.split('\n');
-        stdoutBuffer = lines.pop(); // Keep incomplete line in buffer
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-
-          try {
-            const event = JSON.parse(trimmed);
-
-            // Extract human-readable info from the stream events
-            if (event.type === 'assistant' && event.message?.content) {
-              for (const block of event.message.content) {
-                if (block.type === 'text' && block.text) {
-                  // Claude's text responses — show a preview
-                  const preview = block.text.slice(0, 200).replace(/\n/g, ' ');
-                  addLog('claude', preview);
-                } else if (block.type === 'tool_use') {
-                  // Tool calls — show what Claude Code is doing
-                  addLog('tool', `${block.name}(${JSON.stringify(block.input).slice(0, 150)})`);
-                }
-              }
-            } else if (event.type === 'result') {
-              // Final result object — store for exit handler
-              addLog('system', `Build result received (cost: $${event.total_cost_usd?.toFixed(4) || '?'})`);
-            }
-          } catch (e) {
-            // Not valid JSON — log as raw text
-            addLog('raw', trimmed.slice(0, 200));
-          }
-        }
+        addLog('stdout', data);
       });
 
       proc.stderr.on('data', (data) => {
         stderr += data.toString();
-        const lines = data.toString().trim().split('\n');
-        for (const line of lines) {
-          addLog('stderr', line);
-        }
+        addLog('stderr', data);
       });
 
       proc.on('error', (err) => {
@@ -416,32 +268,24 @@ function build(input) {
         addLog('system', `Process exited with code ${code}, signal ${signal} (${elapsed}s)`);
         activeBuild = null;
 
-        // With stream-json, stdout contains multiple JSON objects (one per line)
-        // The last "result" type object has the final summary
+        // Try to parse the JSON output from Claude Code
         let result = null;
         let costInfo = null;
         try {
-          const allLines = stdout.trim().split('\n');
-          for (const line of allLines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            try {
-              const parsed = JSON.parse(trimmed);
-              if (parsed.type === 'result') {
-                result = parsed;
-                if (result.total_cost_usd) {
-                  costInfo = `$${result.total_cost_usd.toFixed(4)}`;
-                }
-              }
-            } catch (e) {
-              // Skip non-JSON lines
+          // stdout might have multiple JSON objects if streaming, take the last complete one
+          const jsonStr = stdout.trim();
+          if (jsonStr) {
+            result = JSON.parse(jsonStr);
+            if (result.total_cost_usd) {
+              costInfo = `$${result.total_cost_usd.toFixed(4)}`;
             }
           }
         } catch (parseErr) {
-          addLog('parse', `Could not parse stream output: ${parseErr.message}`);
+          // Non-JSON output, that's fine — just use raw text
+          addLog('parse', `Could not parse JSON output: ${parseErr.message}`);
         }
 
-        // Update PROGRESS.md
+        // Update PROGRESS.md in the skill directory
         const progressPath = path.join(skillDir, 'PROGRESS.md');
         const progressEntry = `\n## ${isoTimestamp()} — Claude Code Build\n- Exit code: ${code}\n- Duration: ${elapsed}s\n${costInfo ? `- Cost: ${costInfo}\n` : ''}- Log: ${logFile}\n- Status: ${code === 0 ? 'SUCCESS' : 'FAILED'}\n`;
 
@@ -451,18 +295,23 @@ function build(input) {
           } else {
             fs.writeFileSync(progressPath, `# ${skillName} — Development Progress\n${progressEntry}`);
           }
-        } catch (e) { /* non-fatal */ }
+        } catch (e) {
+          // Non-fatal
+        }
 
-        // Validate the result
+        // Check if handler.js was actually created
         const handlerExists = fs.existsSync(path.join(skillDir, 'handler.js'));
         const skillMdExists = fs.existsSync(path.join(skillDir, 'SKILL.md'));
 
+        // Verify handler.js has required exports
         let handlerValid = false;
         if (handlerExists) {
           try {
             const handlerContent = fs.readFileSync(path.join(skillDir, 'handler.js'), 'utf-8');
             handlerValid = handlerContent.includes('toolDefinition') && handlerContent.includes('execute');
-          } catch (e) { /* can't read */ }
+          } catch (e) {
+            // Can't read, assume invalid
+          }
         }
 
         resolve({
@@ -478,19 +327,22 @@ function build(input) {
           logFile,
           logTail: buildLog.slice(-15).map(l => l.replace(/\[.*?\]\s*/, '')).join('\n'),
           nextSteps: code === 0 && handlerValid
-            ? `Skill built successfully! You can:\n1. Use process_manager to restart staging and test it\n2. Review the code with code_builder read_project action\n3. When happy, promote staging to live`
-            : `Build may have issues. Check the log or use read_project to review.`,
+            ? `Skill built successfully! You can:\n1. Use process_manager to restart staging and test it\n2. Review the code with file_manager read action\n3. When happy, promote staging to live`
+            : `Build may have issues. Check the log or use file_manager to review the generated code.`,
           claudeCodeResult: result?.result || null
         });
       });
 
-      // Feed prompt via stdin
+      // Feed the build prompt to Claude Code via stdin
       proc.stdin.write(buildPrompt);
       proc.stdin.end();
 
     } catch (err) {
       activeBuild = null;
-      resolve({ success: false, error: `Failed to spawn Claude Code: ${err.message}` });
+      resolve({
+        success: false,
+        error: `Failed to spawn Claude Code: ${err.message}`
+      });
     }
   });
 }
@@ -498,10 +350,16 @@ function build(input) {
 // --- Action: build_status ---
 function buildStatus() {
   if (!activeBuild) {
-    return { success: true, building: false, message: 'No build currently in progress.' };
+    return {
+      success: true,
+      building: false,
+      message: 'No build currently in progress.'
+    };
   }
 
   const elapsed = ((Date.now() - activeBuild.startTime) / 1000).toFixed(1);
+
+  // Read last few lines of the log
   let logTail = '';
   try {
     if (fs.existsSync(activeBuild.logFile)) {
@@ -531,6 +389,7 @@ function cancelBuild() {
   }
 
   const { skillName, pid } = activeBuild;
+
   try {
     if (process.platform === 'win32') {
       spawn('taskkill', ['/pid', pid.toString(), '/f', '/t'], { stdio: 'ignore' });
@@ -545,6 +404,7 @@ function cancelBuild() {
 }
 
 // --- Action: list_builds ---
+// Shows recent build logs
 function listBuilds() {
   ensureDir(BUILD_LOG_DIR);
 
@@ -561,7 +421,7 @@ function listBuilds() {
         };
       })
       .sort((a, b) => b.date.localeCompare(a.date))
-      .slice(0, 10);
+      .slice(0, 10); // Last 10 builds
 
     return {
       success: true,
@@ -581,6 +441,7 @@ function readBuildLog(input) {
   ensureDir(BUILD_LOG_DIR);
 
   try {
+    // Find the most recent log for this skill
     const logs = fs.readdirSync(BUILD_LOG_DIR)
       .filter(f => f.startsWith(skillName + '-') && f.endsWith('.log'))
       .sort()
@@ -608,6 +469,7 @@ function readBuildLog(input) {
 }
 
 // --- Action: rebuild ---
+// Convenience: re-runs a build for an existing skill (uses existing prompt)
 function rebuild(input) {
   const { skillName } = input;
   const promptPath = path.join(STAGING_SKILLS_DIR, skillName, '.build-prompt.md');
@@ -620,6 +482,7 @@ function rebuild(input) {
 }
 
 // --- Action: update_prompt ---
+// Updates the build prompt for an existing skill (e.g., to add requirements or fix issues)
 function updatePrompt(input) {
   const { skillName, additionalInstructions } = input;
 
@@ -644,58 +507,43 @@ function updatePrompt(input) {
 }
 
 
-// ============================================================
-// TOOL DEFINITION
-// ============================================================
+// === Tool Definition ===
 
 export const toolDefinition = {
   name: 'code_builder',
-  description: `The unified skill/tool management system. Use this for ALL skill operations:
+  description: `Delegate skill/tool building to Claude Code CLI for high-quality results. This is the primary way to build new skills — instead of writing code directly, generate a detailed build prompt and let Claude Code handle the implementation with its full research and iteration capabilities.
 
-PROJECT MANAGEMENT (immediate, no Claude Code needed):
-- "list_projects" — List all installed skills with their status
-- "read_project" — Read a skill's files (handler.js, SKILL.md, PROGRESS.md)
-- "read_file" — Read any file within a skill folder
-- "write_data_file" — Write to a skill's data/ directory
-- "update_handler" — Directly overwrite a skill's handler.js (for quick manual fixes)
-- "update_skill_md" — Update a skill's SKILL.md documentation
-- "update_progress" — Append to a skill's PROGRESS.md log
+Flow:
+1. "generate_prompt" — Create a detailed build spec (review with Rob)
+2. "build" — Spawn Claude Code to build the skill in staging/skills/
+3. "build_status" — Check progress of active builds
+4. "cancel_build" — Stop a running build
+5. "list_builds" — View recent build history
+6. "read_build_log" — Read logs from a build
+7. "rebuild" — Re-run a build with existing prompt
+8. "update_prompt" — Add/modify instructions for a skill's build prompt
 
-BUILDING NEW SKILLS (delegates to Claude Code for high-quality results):
-- "generate_prompt" — Create a detailed build spec (always do this first, present to Rob for review)
-- "build" — Spawn Claude Code to build the skill in staging/skills/
-- "build_status" — Check progress of an active build
-- "cancel_build" — Stop a running build
-- "list_builds" — View recent build history
-- "read_build_log" — Read detailed logs from a past build
-- "rebuild" — Re-run a build with existing/updated prompt
-- "update_prompt" — Add instructions to a build prompt before rebuilding
-
-WORKFLOW: generate_prompt → (Rob reviews) → build → restart staging → test → promote to live`,
+Always generate the prompt first and present it to Rob for approval before building.`,
   input_schema: {
     type: 'object',
     properties: {
       action: {
         type: 'string',
         enum: [
-          'list_projects', 'read_project', 'read_file', 'write_data_file',
-          'update_handler', 'update_skill_md', 'update_progress',
-          'generate_prompt', 'build', 'build_status', 'cancel_build',
-          'list_builds', 'read_build_log', 'rebuild', 'update_prompt'
+          'generate_prompt',
+          'build',
+          'build_status',
+          'cancel_build',
+          'list_builds',
+          'read_build_log',
+          'rebuild',
+          'update_prompt'
         ],
         description: 'What to do'
       },
       skillName: {
         type: 'string',
         description: 'Skill folder name (kebab-case, e.g. "weather-lookup")'
-      },
-      content: {
-        type: 'string',
-        description: 'File content for update_handler, update_skill_md, update_progress, write_data_file'
-      },
-      fileName: {
-        type: 'string',
-        description: 'For read_file/write_data_file: relative path within the skill folder'
       },
       description: {
         type: 'string',
@@ -712,7 +560,7 @@ WORKFLOW: generate_prompt → (Rob reviews) → build → restart staging → te
       },
       dataNeeds: {
         type: 'string',
-        description: 'For generate_prompt: What persistent data the skill needs (if any)'
+        description: 'For generate_prompt: What persistent data the skill needs to store (if any)'
       },
       existingCode: {
         type: 'string',
@@ -740,25 +588,22 @@ export async function execute(input) {
 
   try {
     switch (action) {
-      // Project management
-      case 'list_projects':       return listProjects();
-      case 'read_project':        return readProject(input);
-      case 'read_file':           return readFile(input);
-      case 'write_data_file':     return writeDataFile(input);
-      case 'update_handler':      return updateHandler(input);
-      case 'update_skill_md':     return updateSkillMd(input);
-      case 'update_progress':     return updateProgress(input);
-
-      // Claude Code builds
-      case 'generate_prompt':     return generatePrompt(input);
-      case 'build':               return await build(input);
-      case 'build_status':        return buildStatus();
-      case 'cancel_build':        return cancelBuild();
-      case 'list_builds':         return listBuilds();
-      case 'read_build_log':      return readBuildLog(input);
-      case 'rebuild':             return await rebuild(input);
-      case 'update_prompt':       return updatePrompt(input);
-
+      case 'generate_prompt':
+        return generatePrompt(input);
+      case 'build':
+        return await build(input);
+      case 'build_status':
+        return buildStatus();
+      case 'cancel_build':
+        return cancelBuild();
+      case 'list_builds':
+        return listBuilds();
+      case 'read_build_log':
+        return readBuildLog(input);
+      case 'rebuild':
+        return await rebuild(input);
+      case 'update_prompt':
+        return updatePrompt(input);
       default:
         return { success: false, error: `Unknown action: ${action}` };
     }

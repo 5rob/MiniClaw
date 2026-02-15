@@ -1,9 +1,10 @@
 // src/index.js
 // Entry point — wires everything together
+// v1.13 — Start periodic re-indexing on boot
 import 'dotenv/config';
 import { initCalendar } from './calendar.js';
 import { startDiscord } from './discord.js';
-import { initMemoryIndex, indexMemoryFiles } from './memory-index.js';
+import { initMemoryIndex, indexMemoryFiles, startPeriodicReindex } from './memory-index.js';
 
 console.log('\n=== MiniClaw Starting ===');
 console.log(`Time: ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney' })}`);
@@ -32,13 +33,16 @@ try {
   console.log('[MemoryIndex] Initialized');
 
   // Index memory files asynchronously (don't block startup)
+  // v1.13: Start periodic re-indexing after initial pass
   indexMemoryFiles()
     .then(() => {
       console.log('[MemoryIndex] Initial indexing complete');
+      startPeriodicReindex(300_000); // 5 minutes, matches OpenClaw QMD default
     })
     .catch(err => {
       console.warn('[MemoryIndex] Initial indexing failed (non-fatal):', err.message);
       console.warn('[MemoryIndex] Hybrid search will fall back to keyword-only');
+      startPeriodicReindex(300_000); // Still start periodic even if initial fails
     });
 } catch (err) {
   console.error('[MemoryIndex] Initialization failed (non-fatal):', err.message);

@@ -1,5 +1,6 @@
 // src/claude.js
 // Anthropic API client with tool use loop, compaction, and system prompt builder
+// v1.13 — Lightweight system prompt for Haiku, no tools for Haiku mode, debounced re-indexing
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import path from 'path';
@@ -26,41 +27,60 @@ function readFileIfExists(filePath) {
   }
 }
 
-function buildSystemPrompt() {
+/**
+ * Build the system prompt.
+ * @param {boolean} lightweight - If true, skip memory/skills for Haiku chat mode
+ */
+function buildSystemPrompt(lightweight = false) {
   const cfg = loadConfig();
 
-  // Load SOUL.md and IDENTITY.md (OpenClaw-style personality files)
   const soul = readFileIfExists(path.resolve(cfg.personality.soulFile || 'SOUL.md'));
   const identity = readFileIfExists(path.resolve(cfg.personality.identityFile || 'IDENTITY.md'));
-  const longTermMemory = memory.readLongTermMemory();
-  const recentLogs = memory.loadRecentDailyLogs(cfg.memory.loadDaysBack);
 
-  // Load SKILL.md files for context (like OpenClaw does)
-  const skillsDir = path.resolve('skills');
-  let skillDescriptions = '';
-
-  if (fs.existsSync(skillsDir)) {
-    try {
-      for (const name of fs.readdirSync(skillsDir)) {
-        const skillMd = path.join(skillsDir, name, 'SKILL.md');
-        if (fs.existsSync(skillMd)) {
-          skillDescriptions += `\n### Skill: ${name}\n${fs.readFileSync(skillMd, 'utf-8')}\n`;
-        }
-      }
-    } catch (err) {
-      console.error('[Claude] Error loading skill descriptions:', err.message);
-    }
-  }
-
-  const dailyLogSection = recentLogs.length > 0
-    ? recentLogs.map(l => `### ${l.date}\n${l.content}`).join('\n')
-    : '(No recent daily logs)';
-
-  return `${soul || '(No SOUL.md found — create one to define your personality)'}
+  // Always include personality
+  let prompt = `${soul || '(No SOUL.md found — create one to define your personality)'}
 
 ${identity ? `## Identity\n${identity}` : ''}
 
-Current date/time: ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney' })}
+Current date/time: ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney' })}`;
+
+  // Staging notice (always included)
+  const botRole = process.env.BOT_ROLE || 'live';
+  if (botRole === 'staging') {
+    prompt += `\n\n## ⚠️ Staging Instance Notice\nYou are **Tester Bud**, the staging/test instance. You exist for testing new features in the #staging channel. You share memory with the live bot but you are NOT the live bot. When greeted, identify yourself as Tester Bud. Do not claim to be the main/live instance. Your purpose is to test experimental changes safely before they go live.\n`;
+  }
+
+  if (lightweight) {
+    // Haiku mode — minimal context, no memory dump, no skill descriptions
+    prompt += `
+
+## Note
+You are in lightweight chat mode. You don't have access to tools right now. If Rob asks you to do something that needs tools (memory, calendar, files, building), let him know and he can switch to a more capable mode with !sonnet or !opus. Keep your responses natural and conversational.`;
+  } else {
+    // Full mode — include everything
+    const longTermMemory = memory.readLongTermMemory();
+    const recentLogs = memory.loadRecentDailyLogs(cfg.memory.loadDaysBack);
+
+    const skillsDir = path.resolve('skills');
+    let skillDescriptions = '';
+    if (fs.existsSync(skillsDir)) {
+      try {
+        for (const name of fs.readdirSync(skillsDir)) {
+          const skillMd = path.join(skillsDir, name, 'SKILL.md');
+          if (fs.existsSync(skillMd)) {
+            skillDescriptions += `\n### Skill: ${name}\n${fs.readFileSync(skillMd, 'utf-8')}\n`;
+          }
+        }
+      } catch (err) {
+        console.error('[Claude] Error loading skill descriptions:', err.message);
+      }
+    }
+
+    const dailyLogSection = recentLogs.length > 0
+      ? recentLogs.map(l => `### ${l.date}\n${l.content}`).join('\n')
+      : '(No recent daily logs)';
+
+    prompt += `
 
 ## Your Long-Term Memory
 ${longTermMemory}
@@ -72,88 +92,91 @@ ${dailyLogSection}
 ${skillDescriptions || '(No custom skills installed yet)'}
 
 ## Guidelines
+- Budget your tool calls carefully.
+- When editing files with file_manager, read the file once, make all changes in memory, then write the complete updated file in a single write call. Do not make multiple partial writes or re-read the same file repeatedly.
 - When I say "remember this" or share important info, write it to long-term memory immediately using memory_write.
 - Log significant events and task completions to the daily log using memory_append_daily.
 - Before answering questions about my preferences or past events, search memory using memory_search.
-- When I ask you to build a new skill/tool, use the skill_builder tool to manage the project.
-- Always use Australian Eastern time (AEDT/AEST) for calendar operations.
-- You can update SOUL.md and IDENTITY.md to evolve your personality — but always tell me when you do.`;
+- When I ask you to build a new skill/tool, use the code_builder tool to manage the project.
+- Always use Australian Eastern time (AEDT/AEST) for calendar operations.`;
+  }
+
+  return prompt;
 }
 
-// Conversation history per-channel (in-memory, resets on restart)
-// Using Map instead of object with _flushed property hack
+// Conversation history per channel
 const conversationHistory = new Map();
-const conversationState = new Map(); // Track flush state per channel
-const MAX_HISTORY = 40; // messages per channel (backup limit)
+const conversationState = new Map();
+
+const MAX_HISTORY = 50; // Max message pairs to keep
+const MAX_ITERATIONS = 10; // Max tool-use loops per turn
 
 export async function chat(channelId, userMessage) {
   const cfg = loadConfig();
 
-  // Get or create conversation history for this channel
   if (!conversationHistory.has(channelId)) {
     conversationHistory.set(channelId, []);
-    conversationState.set(channelId, { flushed: false });
   }
 
   const history = conversationHistory.get(channelId);
-  const state = conversationState.get(channelId);
 
   // Add user message
   history.push({ role: 'user', content: userMessage });
 
   try {
-    // --- Compaction check (OpenClaw-style) ---
-    if (cfg.compaction?.enabled) {
-      const status = needsCompaction(history);
+    // Check for compaction
+    const compactionCheck = needsCompaction(history);
 
-      if (status.shouldFlush && !state.flushed) {
-        // Pre-compaction memory flush: let the AI save important context
-        console.log(`[Claude] Approaching context limit (${status.currentTokens} tokens), flushing memory...`);
-        await memoryFlush(history);
-        state.flushed = true; // prevent double-flush (like OpenClaw)
-      }
-
-      if (status.shouldCompact) {
-        console.log(`[Claude] Context limit reached (${status.currentTokens} tokens), compacting...`);
-        const compacted = await compactHistory(history);
-        history.length = 0;
-        history.push(...compacted);
-        state.flushed = false; // reset flush tracker
-
-        // Re-index memory after flush may have written new content
-        try {
-          const { indexMemoryFiles } = await import('./memory-index.js');
-          indexMemoryFiles().catch(err => console.error('[Index]', err.message));
-        } catch (err) {
-          // Memory index not available, continue
-        }
+    if (compactionCheck.shouldFlush) {
+      console.log(`[Claude] Context at ${compactionCheck.currentTokens} tokens — running memory flush`);
+      await memoryFlush(history);
+      // Mark index as dirty after compaction flush (re-indexes in background)
+      try {
+        const { markDirty } = await import('./memory-index.js');
+        markDirty();
+      } catch (err) {
+        // Memory index not available, continue
       }
     }
 
-    // Trim history if too long (message count, separate from token-based compaction)
+    if (compactionCheck.shouldCompact) {
+      console.log(`[Claude] Compacting history (${compactionCheck.currentTokens} tokens)`);
+      const compacted = await compactHistory(history);
+      history.length = 0;
+      history.push(...compacted);
+    }
+
+    // Trim history if too long (message count)
     while (history.length > MAX_HISTORY) {
       history.shift();
     }
 
-    const tools = await getAllTools();
-    const systemPrompt = buildSystemPrompt();
+    // v1.13: Determine if we're in Haiku (lightweight) mode
+    const isHaiku = cfg.model.primary.includes('haiku');
+    const tools = isHaiku ? [] : await getAllTools();
+    const systemPrompt = buildSystemPrompt(isHaiku);
 
     let messages = [...history];
     let response;
     let iterations = 0;
-    const MAX_ITERATIONS = 30; // Prevent infinite tool loops
 
     // Tool use loop — keep going until Claude stops calling tools
     while (iterations < MAX_ITERATIONS) {
       iterations++;
 
-      response = await client.messages.create({
+      const apiParams = {
         model: cfg.model.primary,
         max_tokens: cfg.model.maxTokens,
         system: systemPrompt,
-        tools,
         messages
-      });
+      };
+
+      // Only include tools if we have them (not in Haiku mode)
+      if (tools.length > 0) {
+        apiParams.tools = tools;
+      }
+
+      response = await client.messages.create(apiParams);
 
       // Check if Claude wants to use tools
       const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
