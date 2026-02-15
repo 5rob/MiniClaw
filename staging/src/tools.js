@@ -2,7 +2,6 @@
 // Tool registry — loads built-in tools + custom skills
 // v1.10: Added generate_image tool (Gemini image generation)
 // v1.13: Fixed duplicate tool name bug — final dedup + concurrency guard
-// v1.13: Debounced memory re-indexing — markDirty() instead of blocking indexMemoryFiles()
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
@@ -190,25 +189,13 @@ async function executeBuiltIn(name, input) {
       return { longTermMemory: longTerm, recentDailyLogs: dailyLogs };
     }
 
-    case 'memory_write': {
+    case 'memory_write':
       memory.writeLongTermMemory(input.content);
-      // Mark index as dirty — re-index will happen in the background
-      try {
-        const { markDirty } = await import('./memory-index.js');
-        markDirty();
-      } catch (e) { /* index not available, fine */ }
       return { success: true, message: 'Long-term memory updated.' };
-    }
 
-    case 'memory_append_daily': {
+    case 'memory_append_daily':
       memory.appendDailyLog(input.entry);
-      // Mark index as dirty — re-index will happen in the background
-      try {
-        const { markDirty } = await import('./memory-index.js');
-        markDirty();
-      } catch (e) { /* index not available, fine */ }
       return { success: true, message: 'Daily log entry added.' };
-    }
 
     case 'memory_search': {
       // Try hybrid search first, fall back to keyword search

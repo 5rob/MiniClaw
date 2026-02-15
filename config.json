@@ -4,7 +4,7 @@
     "identityFile": "IDENTITY.md"
   },
   "model": {
-    "primary": "claude-haiku-4-5-20251001",
+    "primary": "claude-sonnet-4-5-20250929",
     "fallback": "claude-haiku-4-5-20251001",
     "maxTokens": 16384,
     "contextWindow": 200000

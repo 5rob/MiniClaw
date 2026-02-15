@@ -1,0 +1,17 @@
+{
+  "name": "plex-bot",
+  "version": "1.0.0",
+  "description": "Automated Plex media downloader via Discord",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

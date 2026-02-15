@@ -4,7 +4,7 @@
 import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
-import { loadRecentDailyLogs } from './memory.js';
+import { loadRecentDailyLogs, appendDailyLog } from './memory.js';  // ADDED: appendDailyLog
 import { isGeminiEnabled } from './gemini.js';
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
@@ -32,6 +32,110 @@ function writeHeartbeat() {
     }));
   } catch (err) {
     console.error('[Discord] Failed to write heartbeat:', err.message);
+  }
+}
+
+// --- Conversation Context Buffer (v1.14) ---
+const conversationBuffers = new Map(); // channelId → array of recent messages
+const BUFFER_SIZE = 5; // Keep last 5 messages
+const BUFFER_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * Add a message to the conversation buffer for a channel.
+ * Automatically trims to BUFFER_SIZE and clears stale buffers.
+ */
+function addToConversationBuffer(channelId, role, content) {
+  if (!conversationBuffers.has(channelId)) {
+    conversationBuffers.set(channelId, []);
+  }
+
+  const buffer = conversationBuffers.get(channelId);
+
+  // Check if buffer is stale (last message > 30min ago)
+  if (buffer.length > 0) {
+    const lastTimestamp = new Date(buffer[buffer.length - 1].timestamp).getTime();
+    if (Date.now() - lastTimestamp > BUFFER_TIMEOUT_MS) {
+      buffer.length = 0; // Clear stale buffer
+      console.log(`[Discord] Cleared stale conversation buffer for channel ${channelId}`);
+    }
+  }
+
+  buffer.push({
+    role,
+    content: content.slice(0, 500), // Truncate long messages
+    timestamp: new Date().toISOString()
+  });
+
+  // Keep only last BUFFER_SIZE messages
+  while (buffer.length > BUFFER_SIZE) {
+    buffer.shift();
+  }
+}
+
+/**
+ * Get the conversation buffer for a channel (returns array or null).
+ */
+function getConversationBuffer(channelId) {
+  const buffer = conversationBuffers.get(channelId);
+  if (!buffer || buffer.length === 0) return null;
+
+  // Check if stale
+  const lastTimestamp = new Date(buffer[buffer.length - 1].timestamp).getTime();
+  if (Date.now() - lastTimestamp > BUFFER_TIMEOUT_MS) {
+    conversationBuffers.delete(channelId);
+    return null;
+  }
+
+  return buffer;
+}
+
+/**
+ * Seed conversation buffer from today's daily log on startup.
+ * Parses log entries and populates buffer with last 5 messages.
+ */
+function seedBufferFromDailyLog(channelId) {
+  try {
+    const logs = loadRecentDailyLogs(1); // Load today's log
+    if (logs.length === 0 || !logs[0].content) {
+      console.log('[Discord] No daily log to seed buffer from — starting with empty buffer');
+      return;
+    }
+
+    const logContent = logs[0].content;
+    const lines = logContent.split('\n');
+    const messages = [];
+
+    // Parse log entries: **HH:MM** — User: message or **HH:MM** — Assistant: message
+    for (const line of lines) {
+      const userMatch = line.match(/^\*\*(\d{2}:\d{2})\s*[ap]m\*\*\s*—\s*User:\s*(.+)$/i);
+      const assistantMatch = line.match(/^\*\*(\d{2}:\d{2})\s*[ap]m\*\*\s*—\s*Assistant:\s*(.+)$/i);
+
+      if (userMatch) {
+        messages.push({
+          role: 'user',
+          content: userMatch[2].trim().slice(0, 500),
+          timestamp: new Date().toISOString() // Use current time as fallback
+        });
+      } else if (assistantMatch) {
+        messages.push({
+          role: 'assistant',
+          content: assistantMatch[2].trim().slice(0, 500),
+          timestamp: new Date().toISOString()
+        });
+      }
+    }
+
+    // Take last BUFFER_SIZE messages
+    const seedMessages = messages.slice(-BUFFER_SIZE);
+    if (seedMessages.length > 0) {
+      conversationBuffers.set(channelId, seedMessages);
+      console.log(`[Discord] Seeded conversation buffer with ${seedMessages.length} messages from daily log`);
+    } else {
+      console.log('[Discord] No messages found in daily log — starting with empty buffer');
+    }
+  } catch (err) {
+    console.error('[Discord] Failed to seed buffer from daily log:', err.message);
+    // Gracefully fall back to empty buffer — don't crash
   }
 }
 
@@ -209,8 +313,9 @@ function gatherWakeUpContext() {
 
 /**
  * Generate a context-aware wake-up message using a quick Haiku call.
+ * @param {string|null} channelId - Optional channel ID to include conversation buffer
  */
-async function generateWakeUpMessage() {
+async function generateWakeUpMessage(channelId = null) {
   try {
     const context = gatherWakeUpContext();
 
@@ -222,6 +327,18 @@ async function generateWakeUpMessage() {
 
     if (context.recentActivity) {
       contextBlock += `\n\nRECENT ACTIVITY (tail of today's log):\n${context.recentActivity}`;
+    }
+
+    // Include conversation buffer if available
+    if (channelId) {
+      const conversationContext = getConversationBuffer(channelId);
+      if (conversationContext && conversationContext.length > 0) {
+        contextBlock += `\n\nRECENT CONVERSATION:\n`;
+        for (const msg of conversationContext) {
+          const label = msg.role === 'user' ? 'Rob' : 'You';
+          contextBlock += `${label}: ${msg.content}\n`;
+        }
+      }
     }
 
     const systemPrompt = `You are an AI assistant who just came back online after a restart. Generate a single short wake-up message (1-2 sentences max). Be witty, dry, and casual — not corporate or overly enthusiastic. You have personality: think dry humour, understated competence, maybe a little self-aware about being rebooted.
@@ -321,13 +438,18 @@ export function startDiscord() {
     writeHeartbeat();
     console.log('[Discord] Heartbeat written');
 
-    // Send a context-aware wake-up message
+    // v1.14: Seed conversation buffer from today's daily log BEFORE wake message
     const wakeChannelId = process.env.WAKE_CHANNEL_ID;
+    if (wakeChannelId) {
+      seedBufferFromDailyLog(wakeChannelId);
+    }
+
+    // Send a context-aware wake-up message
     if (wakeChannelId) {
       try {
         const channel = await client.channels.fetch(wakeChannelId);
         if (channel) {
-          const wakeMsg = await generateWakeUpMessage();
+          const wakeMsg = await generateWakeUpMessage(wakeChannelId);
           await channel.send(wakeMsg);
           console.log(`[Discord] Wake-up message sent to #${channel.name || wakeChannelId}`);
         }
@@ -457,12 +579,28 @@ export function startDiscord() {
       await message.channel.sendTyping();
     }
 
+    // Add user message to conversation buffer
+    addToConversationBuffer(message.channel.id, 'user', content);
+
     try {
-      // Get response from Claude
-      const response = await chat(message.channel.id, content);
+      // Get conversation context for this channel
+      const conversationContext = getConversationBuffer(message.channel.id);
+
+      // Get response from Claude (with conversation context)
+      const response = await chat(message.channel.id, content, conversationContext);
+
+      // v1.13: Log assistant response to daily log (ADDED)
+      if (response && response.trim().length > 0) {
+        await appendDailyLog(`Assistant: ${response.slice(0, 200)}${response.length > 200 ? '...' : ''}`);
+      }
 
       // v1.13: Check if build is complete — auto-reset to Haiku
       checkBuildComplete(response || '');
+
+      // Add assistant response to conversation buffer
+      if (response && response.trim().length > 0) {
+        addToConversationBuffer(message.channel.id, 'assistant', response);
+      }
 
       // v2.0: Check for generated images to attach
       let attachments = [];

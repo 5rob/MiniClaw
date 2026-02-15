@@ -13,10 +13,12 @@ const MEMORY_DIR = path.resolve('memory');
 let db = null;
 let config = null;
 
-// --- Debounced re-indexing ---
+// --- Debounced re-indexing (v1.13) ---
 let reindexTimer = null;
 let reindexDirty = false;
 const REINDEX_DEBOUNCE_MS = 30000; // 30 seconds
+
+// --- Initialization ---
 
 export function initMemoryIndex() {
   try {
@@ -244,9 +246,16 @@ export async function indexMemoryFiles() {
   }
 }
 
-// --- Debounced Re-indexing ---
+// --- Debounced Re-indexing (v1.13) ---
 
-// Mark the index as needing a refresh (called after memory writes)
+/**
+ * Mark the memory index as needing a refresh.
+ * Called after memory writes instead of indexMemoryFiles() directly.
+ *
+ * Uses a non-resetting timer: the first dirty mark starts a 30s countdown.
+ * Subsequent dirty marks within that window do NOT reset the timer.
+ * This guarantees a max 30s wait from the first change, not from the last.
+ */
 export function markDirty() {
   reindexDirty = true;
 
@@ -267,9 +276,14 @@ export function markDirty() {
   }
 }
 
-// Start a periodic re-index interval (call once at startup)
+/**
+ * Start a periodic re-index interval. Call once at startup.
+ * Runs unconditionally (not gated behind dirty flag) to catch:
+ * - File changes made outside the bot (manual edits to MEMORY.md)
+ * - Edge cases where markDirty() wasn't triggered
+ * Matches OpenClaw's QMD backend pattern (default every 5 minutes).
+ */
 export function startPeriodicReindex(intervalMs = 300000) {
-  // Default: every 5 minutes, like OpenClaw's QMD backend
   setInterval(async () => {
     console.log('[MemoryIndex] Periodic re-index');
     try {
@@ -290,7 +304,7 @@ export async function hybridSearch(query, maxResults = 10) {
     // 1. BM25 keyword search via FTS5
     const ftsResults = db.prepare(`
       SELECT chunks.id, chunks.content, chunks.line_start, chunks.line_end,
-             files.path, bm25(chunks_fts) as bm25_score
+           files.path, bm25(chunks_fts) as bm25_score
       FROM chunks_fts
       JOIN chunks ON chunks.id = chunks_fts.rowid
       JOIN files ON files.id = chunks.file_id
@@ -308,7 +322,7 @@ export async function hybridSearch(query, maxResults = 10) {
       // Get all chunks with embeddings and compute cosine similarity
       const allChunks = db.prepare(`
         SELECT chunks.id, chunks.content, chunks.line_start, chunks.line_end,
-               files.path, chunks.embedding
+             files.path, chunks.embedding
         FROM chunks
         JOIN files ON files.id = chunks.file_id
         WHERE chunks.embedding IS NOT NULL

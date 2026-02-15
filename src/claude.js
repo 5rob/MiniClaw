@@ -111,7 +111,7 @@ const conversationState = new Map();
 const MAX_HISTORY = 50; // Max message pairs to keep
 const MAX_ITERATIONS = 10; // Max tool-use loops per turn
 
-export async function chat(channelId, userMessage) {
+export async function chat(channelId, userMessage, conversationContext = null) {
   const cfg = loadConfig();
 
   if (!conversationHistory.has(channelId)) {
@@ -120,8 +120,20 @@ export async function chat(channelId, userMessage) {
 
   const history = conversationHistory.get(channelId);
 
-  // Add user message
-  history.push({ role: 'user', content: userMessage });
+  // Inject conversation context if provided
+  let messageContent = userMessage;
+  if (conversationContext && conversationContext.length > 0) {
+    let contextBlock = '--- Recent Conversation Context ---\n';
+    for (const msg of conversationContext) {
+      const label = msg.role === 'user' ? 'User' : 'Assistant';
+      contextBlock += `${label}: ${msg.content}\n`;
+    }
+    contextBlock += '--- End Context ---\n\n';
+    messageContent = contextBlock + userMessage;
+  }
+
+  // Add user message (with context if applicable)
+  history.push({ role: 'user', content: messageContent });
 
   try {
     // Check for compaction
