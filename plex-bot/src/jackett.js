@@ -16,7 +16,11 @@ export async function searchTorrents(query, type) {
     
     console.log(`🔍 Jackett search URL: ${searchUrl.replace(JACKETT_API_KEY, 'KEY_HIDDEN')}`);
     
-    const res = await fetch(searchUrl);
+    const res = await fetch(searchUrl, {
+      headers: {
+        'Accept': 'application/json' // Request JSON instead of XML
+      }
+    });
     
     if (!res.ok) {
       console.error(`❌ Jackett API error: ${res.status} ${res.statusText}`);
@@ -25,11 +29,11 @@ export async function searchTorrents(query, type) {
       return [];
     }
 
-    const text = await res.text();
-    console.log(`📡 Jackett response length: ${text.length} bytes`);
+    const data = await res.json();
+    console.log(`📡 Jackett response: ${data.Results?.length || 0} results`);
 
-    // Jackett returns XML (Torznab format), parse it manually
-    const torrents = parseJackettXML(text);
+    // Parse Jackett JSON format
+    const torrents = parseJackettJSON(data);
 
     console.log(`📦 Found ${torrents.length} torrents from Jackett`);
 
@@ -42,51 +46,23 @@ export async function searchTorrents(query, type) {
 }
 
 /**
- * Parse Jackett's XML response into structured data
+ * Parse Jackett's JSON response into structured data
  */
-function parseJackettXML(xml) {
-  const torrents = [];
-  
-  // Extract each <item> block
-  const itemRegex = /<item>([\s\S]*?)<\/item>/g;
-  let match;
-
-  while ((match = itemRegex.exec(xml)) !== null) {
-    const itemXml = match[1];
-
-    const title = extractTag(itemXml, 'title');
-    const link = extractTag(itemXml, 'link'); // This is the torrent details page
-    const size = extractTag(itemXml, 'size');
-    const seeders = extractAttribute(itemXml, 'torznab:attr', 'name="seeders"', 'value');
-    const magnetLink = extractTag(itemXml, 'magneturl') || extractTag(itemXml, 'link');
-
-    if (title && magnetLink) {
-      torrents.push({
-        title,
-        magnetLink,
-        size: formatBytes(parseInt(size) || 0),
-        seeders: parseInt(seeders) || 0,
-      });
-    }
+function parseJackettJSON(data) {
+  if (!data.Results || !Array.isArray(data.Results)) {
+    console.error('❌ Unexpected Jackett response format');
+    return [];
   }
 
-  return torrents;
-}
-
-function extractTag(xml, tag) {
-  const regex = new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>`, 'i');
-  const match = xml.match(regex);
-  if (match) return match[1].trim();
-
-  const simpleRegex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i');
-  const simpleMatch = xml.match(simpleRegex);
-  return simpleMatch ? simpleMatch[1].trim() : null;
-}
-
-function extractAttribute(xml, tag, attrCondition, attrName) {
-  const regex = new RegExp(`<${tag}[^>]*${attrCondition}[^>]*${attrName}="([^"]*)"`, 'i');
-  const match = xml.match(regex);
-  return match ? match[1] : null;
+  return data.Results.map(result => ({
+    title: result.Title || 'Unknown',
+    magnetLink: result.MagnetUri || result.Link || null,
+    size: formatBytes(result.Size || 0),
+    seeders: result.Seeders || 0,
+    peers: result.Peers || 0,
+    publishDate: result.PublishDate || null,
+    indexer: result.Tracker || 'Unknown'
+  })).filter(t => t.magnetLink); // Only keep results with magnet links
 }
 
 function formatBytes(bytes) {
