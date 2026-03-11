@@ -1,11 +1,14 @@
 // skills/process-manager/handler.js
 // Manages staging bot process, self-restart signaling, promotion, and revert
-// v1.11 — Added revert action (reset staging to match live)
-import { spawn } from 'child_process';
+// v1.13 — Fixed restart issue after live bot restarts (can now kill orphaned staging processes)
+import { spawn, exec } from 'child_process';
+import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
 import { promote } from './promote.js';
 import { revert } from './revert.js';
+
+const execAsync = promisify(exec);
 
 const PROJECT_ROOT = process.cwd();
 const STAGING_DIR = path.join(PROJECT_ROOT, 'staging');
@@ -88,6 +91,49 @@ function parseDotEnv(filePath) {
   return env;
 }
 
+// Find any staging bot processes that might be running (even if we didn't spawn them)
+async function findStagingPid() {
+  try {
+    if (process.platform === 'win32') {
+      // Windows: use wmic to find node processes
+      const { stdout } = await execAsync('wmic process where "name=\'node.exe\'" get ProcessId,CommandLine /format:csv', { timeout: 5000 });
+      const lines = stdout.split('\n').filter(l => l.trim());
+      for (const line of lines) {
+        if (line.includes('staging') && line.includes('src\\index.js')) {
+          const parts = line.split(',');
+          const pid = parseInt(parts[parts.length - 1], 10);
+          if (!isNaN(pid)) return pid;
+        }
+      }
+    } else {
+      // Unix: use ps to find node processes
+      const { stdout } = await execAsync('ps aux | grep "node.*staging.*src/index.js" | grep -v grep', { timeout: 5000 });
+      const match = stdout.trim().split(/\s+/);
+      if (match.length > 1) {
+        const pid = parseInt(match[1], 10);
+        if (!isNaN(pid)) return pid;
+      }
+    }
+  } catch (err) {
+    // Command failed (probably no process found) — that's fine
+  }
+  return null;
+}
+
+async function killStagingProcess(pid) {
+  try {
+    if (process.platform === 'win32') {
+      await execAsync(`taskkill /pid ${pid} /f /t`, { timeout: 5000 });
+    } else {
+      process.kill(pid, 'SIGTERM');
+    }
+    return true;
+  } catch (err) {
+    console.error(`[ProcessManager] Failed to kill PID ${pid}: ${err.message}`);
+    return false;
+  }
+}
+
 function startStaging() {
   if (stagingProcess && !stagingProcess.killed) {
     return { success: false, error: 'Staging bot is already running. Stop it first or use restart.' };
@@ -152,28 +198,40 @@ function startStaging() {
   }
 }
 
-function stopStaging() {
-  if (!stagingProcess || stagingProcess.killed) {
-    return { success: false, error: 'Staging bot is not running.' };
+async function stopStaging() {
+  // First check if we have a tracked process
+  if (stagingProcess && !stagingProcess.killed) {
+    const pid = stagingProcess.pid;
+    try {
+      if (process.platform === 'win32') {
+        spawn('taskkill', ['/pid', pid.toString(), '/f', '/t'], { stdio: 'ignore' });
+      } else {
+        stagingProcess.kill('SIGTERM');
+      }
+      stagingProcess = null;
+      return { success: true, message: `Staging bot stopped (was PID: ${pid})` };
+    } catch (err) {
+      return { success: false, error: `Failed to stop staging bot: ${err.message}` };
+    }
   }
 
-  const pid = stagingProcess.pid;
+  // If we don't have a tracked process, try to find it
+  const pid = await findStagingPid();
+  if (!pid) {
+    return { success: false, error: 'Staging bot is not running (no process found).' };
+  }
 
-  try {
-    if (process.platform === 'win32') {
-      spawn('taskkill', ['/pid', pid.toString(), '/f', '/t'], { stdio: 'ignore' });
-    } else {
-      stagingProcess.kill('SIGTERM');
-    }
-    stagingProcess = null;
-    return { success: true, message: `Staging bot stopped (was PID: ${pid})` };
-  } catch (err) {
-    return { success: false, error: `Failed to stop staging bot: ${err.message}` };
+  // Found an orphaned staging process — kill it
+  const killed = await killStagingProcess(pid);
+  if (killed) {
+    return { success: true, message: `Orphaned staging bot stopped (was PID: ${pid})` };
+  } else {
+    return { success: false, error: `Found staging process (PID: ${pid}) but failed to kill it.` };
   }
 }
 
-function restartStaging() {
-  const stopResult = stopStaging();
+async function restartStaging() {
+  const stopResult = await stopStaging();
   return new Promise((resolve) => {
     setTimeout(() => {
       const startResult = startStaging();
@@ -187,11 +245,15 @@ function restartStaging() {
   });
 }
 
-function getStatus() {
-  const running = stagingProcess && !stagingProcess.killed;
+async function getStatus() {
+  const trackedRunning = stagingProcess && !stagingProcess.killed;
+  const orphanedPid = trackedRunning ? null : await findStagingPid();
+  
   return {
-    running,
-    pid: running ? stagingProcess.pid : null,
+    running: trackedRunning || !!orphanedPid,
+    pid: trackedRunning ? stagingProcess.pid : orphanedPid,
+    tracked: trackedRunning,
+    orphaned: !!orphanedPid,
     recentLog: stagingLog.slice(-20),
     logLines: stagingLog.length
   };
@@ -305,19 +367,20 @@ export async function execute(input) {
     case 'start':
       return startStaging();
     case 'stop':
-      return stopStaging();
+      return await stopStaging();
     case 'restart':
       return await restartStaging();
     case 'status':
-      return getStatus();
+      return await getStatus();
     case 'read_logs':
       return readLogs(input);
     case 'self_restart':
       return signalSelfRestart(input.reason || 'Manual restart');
     case 'promote': {
       // Stop staging bot first if it's running
-      if (stagingProcess && !stagingProcess.killed) {
-        const stopResult = stopStaging();
+      const statusResult = await getStatus();
+      if (statusResult.running) {
+        const stopResult = await stopStaging();
         if (!stopResult.success) {
           return { success: false, error: `Failed to stop staging bot before promotion: ${stopResult.error}` };
         }
@@ -328,8 +391,9 @@ export async function execute(input) {
     }
     case 'revert': {
       // Stop staging bot first if it's running
-      if (stagingProcess && !stagingProcess.killed) {
-        const stopResult = stopStaging();
+      const statusResult = await getStatus();
+      if (statusResult.running) {
+        const stopResult = await stopStaging();
         if (!stopResult.success) {
           return { success: false, error: `Failed to stop staging bot before revert: ${stopResult.error}` };
         }

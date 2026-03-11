@@ -1,11 +1,11 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
-// v1.13 — Three-tier model routing (Haiku/Sonnet/Opus), manual switch commands, auto-reset after builds
+// v1.15 — Restored attachment processing (text files + Gemini Vision for images)
 import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
 import { loadRecentDailyLogs, appendDailyLog } from './memory.js';  // ADDED: appendDailyLog
-import { isGeminiEnabled } from './gemini.js';
+import { isGeminiEnabled, isImageAttachment, getImageMimeType, describeImage } from './gemini.js';
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import path from 'path';
@@ -405,6 +405,80 @@ function cleanupSentImages(filePaths) {
   }
 }
 
+// --- Attachment Processing (v1.15) ---
+// Text file extensions we'll read and inject
+const TEXT_EXTENSIONS = ['.txt', '.md', '.js', '.ts', '.json', '.csv', '.py', '.html', '.css', '.xml', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.log', '.sh', '.bat', '.ps1', '.env.example'];
+const MAX_TEXT_ATTACHMENT_SIZE = 50000; // 50KB max per text file (to avoid blowing up context)
+
+/**
+ * Check if a Discord attachment is a text file we can read.
+ */
+function isTextAttachment(attachment) {
+  const ext = path.extname(attachment.name || '').toLowerCase();
+  if (TEXT_EXTENSIONS.includes(ext)) return true;
+  // Also check content type for text/*
+  if (attachment.contentType && attachment.contentType.startsWith('text/')) return true;
+  return false;
+}
+
+/**
+ * Process all attachments on a Discord message.
+ * Returns a string to prepend to the message content with attachment info.
+ * - Text files: fetched and content injected
+ * - Images: described via Gemini Vision (if enabled)
+ * - Other files: noted by name/type
+ */
+async function processAttachments(message) {
+  if (!message.attachments || message.attachments.size === 0) return '';
+
+  const parts = [];
+
+  for (const [, attachment] of message.attachments) {
+    try {
+      // --- Image attachments → Gemini Vision ---
+      if (isGeminiEnabled() && isImageAttachment(attachment)) {
+        const mimeType = getImageMimeType(attachment);
+        console.log(`[Attachments] Processing image: ${attachment.name} (${mimeType})`);
+        const description = await describeImage(attachment.url, mimeType);
+        if (description) {
+          parts.push(`[Image: ${attachment.name}]\n${description}`);
+        } else {
+          parts.push(`[Image: ${attachment.name} — could not describe]`);
+        }
+        continue;
+      }
+
+      // --- Text attachments → fetch and inject content ---
+      if (isTextAttachment(attachment)) {
+        if (attachment.size > MAX_TEXT_ATTACHMENT_SIZE) {
+          parts.push(`[File: ${attachment.name} — too large to read (${(attachment.size / 1024).toFixed(1)}KB, max ${MAX_TEXT_ATTACHMENT_SIZE / 1000}KB)]`);
+          continue;
+        }
+
+        console.log(`[Attachments] Reading text file: ${attachment.name} (${(attachment.size / 1024).toFixed(1)}KB)`);
+        const response = await fetch(attachment.url);
+        if (response.ok) {
+          const text = await response.text();
+          parts.push(`[File: ${attachment.name}]\n${text}`);
+        } else {
+          parts.push(`[File: ${attachment.name} — failed to download (HTTP ${response.status})]`);
+        }
+        continue;
+      }
+
+      // --- Other attachments → just note them ---
+      parts.push(`[Attachment: ${attachment.name} (${attachment.contentType || 'unknown type'}, ${(attachment.size / 1024).toFixed(1)}KB)]`);
+
+    } catch (err) {
+      console.error(`[Attachments] Error processing ${attachment.name}:`, err.message);
+      parts.push(`[Attachment: ${attachment.name} — error: ${err.message}]`);
+    }
+  }
+
+  if (parts.length === 0) return '';
+  return '\n\n--- Attached Content ---\n' + parts.join('\n\n') + '\n--- End Attached Content ---\n\n';
+}
+
 // Lazy import for image extraction (only if gemini is available)
 let extractPendingImages;
 let AttachmentBuilder;
@@ -468,65 +542,68 @@ export function startDiscord() {
     writeHeartbeat();
 
     const content = message.content.trim();
-    if (!content) return;
+    const hasAttachments = message.attachments && message.attachments.size > 0;
 
-    // --- Command handling ---
+    // Skip if no content AND no attachments
+    if (!content && !hasAttachments) return;
 
-    // Quick model switch commands (v1.13)
-    if (content === '!haiku') {
-      setModel(MODELS.haiku);
-      await message.reply('Switched to **Haiku** ⚡ (fast & cheap chat mode — no tools)');
-      return;
-    }
-    if (content === '!sonnet') {
-      setModel(MODELS.sonnet);
-      await message.reply('Switched to **Sonnet** 🎵 (balanced, tool-capable)');
-      return;
-    }
-    if (content === '!opus') {
-      setModel(MODELS.opus);
-      await message.reply('Switched to **Opus** 🔥 (full power, build mode)');
-      return;
-    }
-
-    if (content.startsWith('!model')) {
-      const parts = content.split(/\s+/);
-      if (parts.length === 1) {
-        await message.reply(`Current model: \`${getModel()}\``);
-      } else {
-        const newModel = parts[1];
-        setModel(newModel);
-        await message.reply(`Model set to: \`${newModel}\``);
+    // --- Command handling (only if there's text content) ---
+    if (content) {
+      // Quick model switch commands (v1.13)
+      if (content === '!haiku') {
+        setModel(MODELS.haiku);
+        await message.reply('Switched to **Haiku** ⚡ (fast & cheap chat mode — no tools)');
+        return;
       }
-      return;
-    }
-
-    if (content === '!ping') {
-      const startTime = Date.now();
-      const msg = await message.reply('Pong!');
-      await msg.edit(`Pong! Latency: ${Date.now() - startTime}ms`);
-      return;
-    }
-
-    if (content === '!reindex') {
-      await message.reply('Reindexing memory...');
-      try {
-        await indexMemoryFiles();
-        await message.channel.send('✅ Memory index updated');
-      } catch (err) {
-        await message.channel.send(`❌ Reindexing failed: ${err.message}`);
+      if (content === '!sonnet') {
+        setModel(MODELS.sonnet);
+        await message.reply('Switched to **Sonnet** 🎵 (balanced, tool-capable)');
+        return;
       }
-      return;
-    }
+      if (content === '!opus') {
+        setModel(MODELS.opus);
+        await message.reply('Switched to **Opus** 🔥 (full power, build mode)');
+        return;
+      }
 
-    if (content === '!clear') {
-      clearHistory(message.channel.id);
-      await message.reply('Conversation history cleared for this channel.');
-      return;
-    }
+      if (content.startsWith('!model')) {
+        const parts = content.split(/\s+/);
+        if (parts.length === 1) {
+          await message.reply(`Current model: \`${getModel()}\``);
+        } else {
+          const newModel = parts[1];
+          setModel(newModel);
+          await message.reply(`Model set to: \`${newModel}\``);
+        }
+        return;
+      }
 
-    if (content === '!help') {
-      const helpText = `**MiniClaw Commands**
+      if (content === '!ping') {
+        const startTime = Date.now();
+        const msg = await message.reply('Pong!');
+        await msg.edit(`Pong! Latency: ${Date.now() - startTime}ms`);
+        return;
+      }
+
+      if (content === '!reindex') {
+        await message.reply('Reindexing memory...');
+        try {
+          await indexMemoryFiles();
+          await message.channel.send('✅ Memory index updated');
+        } catch (err) {
+          await message.channel.send(`❌ Reindexing failed: ${err.message}`);
+        }
+        return;
+      }
+
+      if (content === '!clear') {
+        clearHistory(message.channel.id);
+        await message.reply('Conversation history cleared for this channel.');
+        return;
+      }
+
+      if (content === '!help') {
+        const helpText = `**MiniClaw Commands**
 
 **Quick Model Switch:**
 \`!haiku\` — Fast & cheap chat mode (no tools)
@@ -545,12 +622,13 @@ export function startDiscord() {
 
 **Auto-routing:** Messages are automatically routed to the right model tier based on content. Build requests → Opus, tool-needing tasks → Sonnet, casual chat → Haiku.`;
 
-      await message.reply(helpText);
-      return;
+        await message.reply(helpText);
+        return;
+      }
     }
 
     // --- Auto Model Switching (v1.13: three-tier) ---
-    const switchResult = autoSwitchModel(content);
+    const switchResult = content ? autoSwitchModel(content) : null;
     let switchNotice = '';
     if (switchResult) {
       switchNotice = `⚡ *Auto-switched to ${switchResult}*\n\n`;
@@ -562,7 +640,7 @@ export function startDiscord() {
     const isHaiku = currentModel === MODELS.haiku || currentModel.includes('haiku');
     let ackMessage = null;
 
-    if (!isHaiku) {
+    if (!isHaiku && content) {
       const ackPromise = generateAckMessage(content);
       await message.channel.sendTyping();
       ackMessage = await ackPromise;
@@ -579,15 +657,24 @@ export function startDiscord() {
       await message.channel.sendTyping();
     }
 
+    // --- Process Attachments (v1.15) ---
+    let attachmentContent = '';
+    if (hasAttachments) {
+      attachmentContent = await processAttachments(message);
+    }
+
+    // Build the full message content: user text + attachment content
+    const fullMessageContent = (content || '') + attachmentContent;
+
     // Add user message to conversation buffer
-    addToConversationBuffer(message.channel.id, 'user', content);
+    addToConversationBuffer(message.channel.id, 'user', content || '[attachment]');
 
     try {
       // Get conversation context for this channel
       const conversationContext = getConversationBuffer(message.channel.id);
 
       // Get response from Claude (with conversation context)
-      const response = await chat(message.channel.id, content, conversationContext);
+      const response = await chat(message.channel.id, fullMessageContent, conversationContext);
 
       // v1.13: Log assistant response to daily log (ADDED)
       if (response && response.trim().length > 0) {

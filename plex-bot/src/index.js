@@ -90,16 +90,30 @@ client.on('messageCreate', async (message) => {
     // Send to qBittorrent
     const downloadName = await addTorrent(best.magnetLink, parsed.type);
     
-    await message.reply(`⏳ Downloading **${availability.title}** [${best.quality || 'Unknown'}, ${best.size}]`);
+    // Send initial status message showing full torrent name
+    const statusMsg = await message.reply(`⏳ Downloading **${best.title}** [${best.size}]`);
 
-    // Poll for completion
-    pollDownload(downloadName, async (success) => {
-      if (success) {
-        await message.channel.send(`✅ **${availability.title}** is ready on Plex!`);
-      } else {
-        await message.channel.send(`⚠️ **${availability.title}** download stalled or failed. You might need to check qBittorrent.`);
+    // Poll for completion with live progress updates
+    pollDownload(
+      downloadName,
+      // Completion callback
+      async (success, name) => {
+        if (success) {
+          await statusMsg.edit(`✅ **${availability.title}** is ready on Plex within the next 15 minutes!`);
+        } else {
+          await statusMsg.edit(`⚠️ **${availability.title}** download stalled or failed. You might need to check qBittorrent.`);
+        }
+      },
+      // Progress callback — edit the status message in place
+      async ({ name, progress, state }) => {
+        try {
+          await statusMsg.edit(`⏳ **${name}**: ${progress}% [${state}]`);
+        } catch (err) {
+          // Ignore edit failures (rate limits, etc.)
+          console.error('Failed to edit progress message:', err.message);
+        }
       }
-    });
+    );
 
   } catch (error) {
     console.error('❌ Error processing request:', error);

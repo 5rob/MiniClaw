@@ -10,14 +10,20 @@
  */
 
 const QUALITY_PREFERENCE = [
+  // 720p gets HIGHEST priority (100-95 range)
   { regex: /bluray.*720p/i, score: 100 },
   { regex: /web-?dl.*720p/i, score: 95 },
   { regex: /webrip.*720p/i, score: 90 },
-  { regex: /bluray.*1080p/i, score: 85 },
-  { regex: /web-?dl.*1080p/i, score: 80 },
-  { regex: /webrip.*1080p/i, score: 75 },
-  { regex: /720p/i, score: 60 },
-  { regex: /1080p/i, score: 50 },
+  { regex: /720p/i, score: 85 }, // Generic 720p
+  
+  // 1080p gets LOWER priority (70-50 range)
+  { regex: /bluray.*1080p/i, score: 70 },
+  { regex: /web-?dl.*1080p/i, score: 65 },
+  { regex: /webrip.*1080p/i, score: 60 },
+  { regex: /1080p/i, score: 50 }, // Generic 1080p
+  
+  // 2160p even lower
+  { regex: /2160p/i, score: 40 },
 ];
 
 const BLACKLIST = [
@@ -50,11 +56,11 @@ export function filterTorrents(torrents) {
   const scored = filtered.map((t) => {
     let score = 0;
 
-    // Quality score
+    // Quality score (only use the FIRST match to avoid double-scoring)
     for (const pref of QUALITY_PREFERENCE) {
       if (pref.regex.test(t.title)) {
         score += pref.score;
-        break;
+        break; // Stop after first match
       }
     }
 
@@ -63,8 +69,8 @@ export function filterTorrents(torrents) {
       score += 20;
     }
 
-    // Seeders bonus (logarithmic scale)
-    score += Math.log10(t.seeders + 1) * 10;
+    // Seeders bonus (logarithmic scale, capped at +30)
+    score += Math.min(Math.log10(t.seeders + 1) * 10, 30);
 
     // Extract quality string for display
     const qualityMatch = t.title.match(/(WEBRip|BluRay|WEB-DL|HDTV).*?(720p|1080p|2160p)/i);
@@ -75,6 +81,12 @@ export function filterTorrents(torrents) {
 
   // Sort by score descending
   scored.sort((a, b) => b.score - a.score);
+
+  console.log(`\n🎯 Top 5 torrents after scoring:`);
+  scored.slice(0, 5).forEach((t, i) => {
+    console.log(`   ${i + 1}. [Score: ${t.score.toFixed(1)}] ${t.title.substring(0, 60)}...`);
+    console.log(`      ${t.size}, ${t.seeders} seeders`);
+  });
 
   return scored;
 }

@@ -1,0 +1,40 @@
+/* Main app layout styles */
+.app-container {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+.sidebar-container {
+  width: 320px;
+  height: 100vh;
+  background-color: #16213e;
+  border-right: 1px solid #0f3460;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.board-container {
+  flex: 1;
+  height: 100vh;
+  position: relative;
+}
+
+/* Custom scrollbar for sidebar */
+.sidebar-container::-webkit-scrollbar {
+  width: 8px;
+}
+
+.sidebar-container::-webkit-scrollbar-track {
+  background: #16213e;
+}
+
+.sidebar-container::-webkit-scrollbar-thumb {
+  background: #0f3460;
+  border-radius: 4px;
+}
+
+.sidebar-container::-webkit-scrollbar-thumb:hover {
+  background: #1a5490;
+}

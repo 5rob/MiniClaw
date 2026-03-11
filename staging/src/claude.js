@@ -109,7 +109,7 @@ const conversationHistory = new Map();
 const conversationState = new Map();
 
 const MAX_HISTORY = 50; // Max message pairs to keep
-const MAX_ITERATIONS = 10; // Max tool-use loops per turn
+const MAX_ITERATIONS = 30; // Max tool-use loops per turn
 
 export async function chat(channelId, userMessage, conversationContext = null) {
   const cfg = loadConfig();

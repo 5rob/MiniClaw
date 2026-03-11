@@ -1,0 +1,27 @@
+{
+  "version": "v1.13",
+  "promoted": [
+    ".env.example",
+    ".gitattributes",
+    ".gitignore",
+    ".heartbeat",
+    "apps",
+    "auth-server.js",
+    "CLAUDE-CODE-PROMPT.md",
+    "config.json",
+    "generated_1771046123096.png",
+    "google-tokens.json",
+    "images.png",
+    "investigation-board",
+    "MiniClaw-Setup-Guide.md",
+    "package.json",
+    "plex-bot",
+    "QUICKSTART.md",
+    "README.md",
+    "skills",
+    "src",
+    "watchdog.js"
+  ],
+  "timestamp": "2026-03-11T23:03:26.692Z",
+  "backupDir": "C:\\Users\\Rob\\Desktop\\MiniClaw\\backups\\v-v1.13-2026-03-11T23-03-09"
+}
