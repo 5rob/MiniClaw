@@ -1,0 +1,5 @@
+#run plex bot
+C:\Users\Rob\Desktop\MiniClaw\plex-bot> npm start
+
+#run watchdog
+node watchdog.js

@@ -1,6 +1,7 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
 // v1.15 — Restored attachment processing (text files + Gemini Vision for images)
+// v1.16 — Added voice channel support (GuildVoiceStates intent)
 import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { chat, setModel, getModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
@@ -15,7 +16,8 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.DirectMessages
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildVoiceStates  // ← ADDED for voice channel support
   ],
   partials: [Partials.Channel] // needed for DMs
 });
@@ -518,6 +520,18 @@ export function startDiscord() {
       seedBufferFromDailyLog(wakeChannelId);
     }
 
+    // v1.16: Initialize voice-chat skill
+    try {
+      const voiceChatPath = path.resolve('skills/voice-chat/handler.js');
+      const voiceChat = await import(`file:///${voiceChatPath.replace(/\\/g, '/')}`);
+      if (voiceChat.init) {
+        voiceChat.init(client);
+        console.log('[Discord] Voice chat skill initialized');
+      }
+    } catch (err) {
+      console.error('[Discord] Failed to initialize voice chat:', err.message);
+    }
+
     // Send a context-aware wake-up message
     if (wakeChannelId) {
       try {
@@ -603,24 +617,7 @@ export function startDiscord() {
       }
 
       if (content === '!help') {
-        const helpText = `**MiniClaw Commands**
-
-**Quick Model Switch:**
-\`!haiku\` — Fast & cheap chat mode (no tools)
-\`!sonnet\` — Balanced mode with tools
-\`!opus\` — Full power build mode
-
-**Model Management:**
-\`!model\` — Show current model
-\`!model <model-id>\` — Switch to a specific model ID
-
-**System:**
-\`!ping\` — Check bot latency
-\`!reindex\` — Rebuild memory search index
-\`!clear\` — Clear conversation history for this channel
-\`!help\` — Show this help message
-
-**Auto-routing:** Messages are automatically routed to the right model tier based on content. Build requests → Opus, tool-needing tasks → Sonnet, casual chat → Haiku.`;
+        const helpText = `**MiniClaw Commands**\n\n**Quick Model Switch:**\n\`!haiku\` — Fast & cheap chat mode (no tools)\n\`!sonnet\` — Balanced mode with tools\n\`!opus\` — Full power build mode\n\n**Model Management:**\n\`!model\` — Show current model\n\`!model <model-id>\` — Switch to a specific model ID\n\n**System:**\n\`!ping\` — Check bot latency\n\`!reindex\` — Rebuild memory search index\n\`!clear\` — Clear conversation history for this channel\n\`!help\` — Show this help message\n\n**Auto-routing:** Messages are automatically routed to the right model tier based on content. Build requests → Opus, tool-needing tasks → Sonnet, casual chat → Haiku.`;
 
         await message.reply(helpText);
         return;
@@ -776,3 +773,6 @@ function splitMessage(text, maxLength) {
 
   return chunks;
 }
+
+// Export client for voice integration
+export { client };
