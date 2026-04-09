@@ -1,11 +1,13 @@
 // src/discord.js
 // Discord bot with owner-only security, typing indicators, message splitting
-// v1.15 — Restored attachment processing (text files + Gemini Vision for images)
-import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
-import { chat, setModel, getModel, clearHistory } from './claude.js';
+// v1.18 — Gemma default routing with auto-upgrade to Claude
+import { Client, GatewayIntentBits, Partials, AttachmentBuilder } from 'discord.js';
+import { chat, forceGemmaE4B, forceGemma31B, forceSonnet, forceOpus, getModelStatus } from './gemma.js';
+import { setModel as claudeSetModel, getModel as claudeGetModel, clearHistory } from './claude.js';
 import { indexMemoryFiles } from './memory-index.js';
-import { loadRecentDailyLogs, appendDailyLog } from './memory.js';  // ADDED: appendDailyLog
+import { loadRecentDailyLogs, appendDailyLog } from './memory.js';
 import { isGeminiEnabled, isImageAttachment, getImageMimeType, describeImage } from './gemini.js';
+import { drainPendingAttachments } from './pending-attachments.js';
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import path from 'path';
@@ -15,9 +17,10 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.DirectMessages
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildVoiceStates
   ],
-  partials: [Partials.Channel] // needed for DMs
+  partials: [Partials.Channel]
 });
 
 // --- Heartbeat (v1.9) ---
@@ -36,14 +39,10 @@ function writeHeartbeat() {
 }
 
 // --- Conversation Context Buffer (v1.14) ---
-const conversationBuffers = new Map(); // channelId → array of recent messages
-const BUFFER_SIZE = 5; // Keep last 5 messages
-const BUFFER_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+const conversationBuffers = new Map();
+const BUFFER_SIZE = 5;
+const BUFFER_TIMEOUT_MS = 30 * 60 * 1000;
 
-/**
- * Add a message to the conversation buffer for a channel.
- * Automatically trims to BUFFER_SIZE and clears stale buffers.
- */
 function addToConversationBuffer(channelId, role, content) {
   if (!conversationBuffers.has(channelId)) {
     conversationBuffers.set(channelId, []);
@@ -51,35 +50,29 @@ function addToConversationBuffer(channelId, role, content) {
 
   const buffer = conversationBuffers.get(channelId);
 
-  // Check if buffer is stale (last message > 30min ago)
   if (buffer.length > 0) {
     const lastTimestamp = new Date(buffer[buffer.length - 1].timestamp).getTime();
     if (Date.now() - lastTimestamp > BUFFER_TIMEOUT_MS) {
-      buffer.length = 0; // Clear stale buffer
+      buffer.length = 0;
       console.log(`[Discord] Cleared stale conversation buffer for channel ${channelId}`);
     }
   }
 
   buffer.push({
     role,
-    content: content.slice(0, 500), // Truncate long messages
+    content: content.slice(0, 500),
     timestamp: new Date().toISOString()
   });
 
-  // Keep only last BUFFER_SIZE messages
   while (buffer.length > BUFFER_SIZE) {
     buffer.shift();
   }
 }
 
-/**
- * Get the conversation buffer for a channel (returns array or null).
- */
 function getConversationBuffer(channelId) {
   const buffer = conversationBuffers.get(channelId);
   if (!buffer || buffer.length === 0) return null;
 
-  // Check if stale
   const lastTimestamp = new Date(buffer[buffer.length - 1].timestamp).getTime();
   if (Date.now() - lastTimestamp > BUFFER_TIMEOUT_MS) {
     conversationBuffers.delete(channelId);
@@ -89,13 +82,9 @@ function getConversationBuffer(channelId) {
   return buffer;
 }
 
-/**
- * Seed conversation buffer from today's daily log on startup.
- * Parses log entries and populates buffer with last 5 messages.
- */
 function seedBufferFromDailyLog(channelId) {
   try {
-    const logs = loadRecentDailyLogs(1); // Load today's log
+    const logs = loadRecentDailyLogs(1);
     if (logs.length === 0 || !logs[0].content) {
       console.log('[Discord] No daily log to seed buffer from — starting with empty buffer');
       return;
@@ -105,7 +94,6 @@ function seedBufferFromDailyLog(channelId) {
     const lines = logContent.split('\n');
     const messages = [];
 
-    // Parse log entries: **HH:MM** — User: message or **HH:MM** — Assistant: message
     for (const line of lines) {
       const userMatch = line.match(/^\*\*(\d{2}:\d{2})\s*[ap]m\*\*\s*—\s*User:\s*(.+)$/i);
       const assistantMatch = line.match(/^\*\*(\d{2}:\d{2})\s*[ap]m\*\*\s*—\s*Assistant:\s*(.+)$/i);
@@ -114,7 +102,7 @@ function seedBufferFromDailyLog(channelId) {
         messages.push({
           role: 'user',
           content: userMatch[2].trim().slice(0, 500),
-          timestamp: new Date().toISOString() // Use current time as fallback
+          timestamp: new Date().toISOString()
         });
       } else if (assistantMatch) {
         messages.push({
@@ -125,7 +113,6 @@ function seedBufferFromDailyLog(channelId) {
       }
     }
 
-    // Take last BUFFER_SIZE messages
     const seedMessages = messages.slice(-BUFFER_SIZE);
     if (seedMessages.length > 0) {
       conversationBuffers.set(channelId, seedMessages);
@@ -135,137 +122,11 @@ function seedBufferFromDailyLog(channelId) {
     }
   } catch (err) {
     console.error('[Discord] Failed to seed buffer from daily log:', err.message);
-    // Gracefully fall back to empty buffer — don't crash
   }
 }
 
-// --- Three-Tier Model Routing (v1.13) ---
-const MODELS = {
-  haiku: 'claude-haiku-4-5-20251001',
-  sonnet: 'claude-sonnet-4-5-20250929',
-  opus: 'claude-opus-4-6'
-};
-
-// Messages that need Opus — building, coding, complex dev work
-const BUILD_TRIGGERS = [
-  /\blet'?s\s+(build|work on|tackle|get to work|implement|get #?\d)/i,
-  /\bcan (you|we)\s+(build|implement|create|write|code|develop|set up|upgrade)/i,
-  /\bstart\s+(building|coding|implementing|working)/i,
-  /\bget\s+(this|that|it)\s+(built|done|implemented|working|going)/i,
-  /\btime to\s+(build|code|work)/i,
-  /\blet'?s\s+do\s+(it|this|that)\b/i,
-  /\blet'?s\s+get\s+#?\d/i,
-  /\bgenerate.+prompt/i,
-  /\bkick off.+(build|skill)/i,
-];
-
-// Messages that need Sonnet — tool use, reasoning, questions needing memory/calendar/search
-const TOOL_TRIGGERS = [
-  // Calendar
-  /\b(calendar|schedule|appointment|event|meeting|what'?s on|free time|busy)\b/i,
-  /\b(remind|reminder|tomorrow|next week|this week)\b/i,
-  // Memory operations
-  /\b(remember|forget|what do you know|do you recall|you mentioned)\b/i,
-  /\b(save|store|write|update|note)\s+(this|that|it|down)\b/i,
-  // Search / research / web
-  /\b(search|look up|find|fetch|web|browse|research)\b/i,
-  // Image generation
-  /\b(generate|create|make|draw)\s+(an?\s+)?(image|picture|photo|art|illustration)\b/i,
-  // File operations
-  /\b(read|write|edit|create|delete|list)\s+(file|files|the file|my file)/i,
-  // Skill/tool management (non-build)
-  /\b(list|show|check|inspect)\s+(skills|tools|projects)/i,
-  // Process management
-  /\b(promote|restart|deploy|staging|status)\b/i,
-  // Questions that likely need memory search or reasoning
-  /\bwhat (did|was|were|is|are|has)\b.{10,}/i,
-  /\b(how|why|when|where)\b.{10,}\?$/i,
-  // Explicit tool requests
-  /\b(use|call|run|execute|invoke)\s+(the\s+)?\w+\s+tool\b/i,
-];
-
-// Wind-down triggers — switch back to Haiku
-const CHAT_TRIGGERS = [
-  /\bjust\s+chat/i,
-  /\btake\s+a\s+break/i,
-  /\bdone\s+(building|coding|working)/i,
-  /\bstop\s+(building|coding|working)/i,
-  /\bwind\s+down/i,
-  /\bthat'?s\s+(it|all)\s+for\s+(now|today|tonight)/i,
-  /\bno\s+more\s+(building|coding|work)/i,
-  /\bswitch\s+to\s+haiku\b/i,
-];
-
-// Build completion patterns — auto-reset from Opus to Haiku
-const BUILD_DONE_PATTERNS = [
-  /build\s+(is\s+)?(complete|done|finished|succeeded)/i,
-  /successfully\s+built/i,
-  /skill\s+(is\s+)?ready/i,
-  /deployed?\s+to\s+staging/i,
-  /promotion\s+(complete|done|succeeded)/i,
-  /want\s+to\s+test/i,
-];
-
-/**
- * Detect which model tier a message needs.
- * Returns 'opus', 'sonnet', 'haiku', or null (no change).
- */
-function detectModelContext(messageContent) {
-  // Build triggers → Opus (highest priority)
-  for (const pattern of BUILD_TRIGGERS) {
-    if (pattern.test(messageContent)) return 'opus';
-  }
-
-  // Tool triggers → Sonnet
-  for (const pattern of TOOL_TRIGGERS) {
-    if (pattern.test(messageContent)) return 'sonnet';
-  }
-
-  // Wind-down triggers → Haiku
-  for (const pattern of CHAT_TRIGGERS) {
-    if (pattern.test(messageContent)) return 'haiku';
-  }
-
-  // No trigger matched — return null (use current model, which defaults to Haiku)
-  return null;
-}
-
-/**
- * Apply auto model switch if context detection finds a trigger.
- * Returns a string describing the switch, or null if no switch happened.
- */
-function autoSwitchModel(messageContent) {
-  const switchTo = detectModelContext(messageContent);
-  if (!switchTo) return null;
-
-  const modelId = MODELS[switchTo];
-  const currentModel = getModel();
-
-  if (currentModel === modelId) return null; // Already on the right model
-
-  setModel(modelId);
-  const label = switchTo.charAt(0).toUpperCase() + switchTo.slice(1);
-  console.log(`[AutoSwitch] ${switchTo} mode — ${currentModel} → ${modelId}`);
-  return label;
-}
-
-/**
- * Check if a response indicates build completion. If so, auto-reset to Haiku.
- */
-function checkBuildComplete(responseText) {
-  if (getModel() !== MODELS.opus) return;
-
-  for (const pattern of BUILD_DONE_PATTERNS) {
-    if (pattern.test(responseText)) {
-      setModel(MODELS.haiku);
-      console.log('[AutoSwitch] Build complete — returning to Haiku');
-      return;
-    }
-  }
-}
-
-// --- Haiku Quick-Call Helper (shared by wake-up and ack) ---
-const haiku = new Anthropic(); // Uses ANTHROPIC_API_KEY from env
+// --- Haiku Quick-Call Helper (for wake/ack only) ---
+const haiku = new Anthropic();
 
 async function haikuQuickCall(system, userContent, maxTokens = 100) {
   const response = await haiku.messages.create({
@@ -277,11 +138,6 @@ async function haikuQuickCall(system, userContent, maxTokens = 100) {
   return response.content[0]?.text?.trim() || null;
 }
 
-/**
- * Gather context for the wake-up message (v1.8):
- * - Recent daily log entries
- * - Upgrade context file (if this is a post-promotion restart)
- */
 function gatherWakeUpContext() {
   const context = { recentActivity: null, upgrade: null };
 
@@ -311,10 +167,6 @@ function gatherWakeUpContext() {
   return context;
 }
 
-/**
- * Generate a context-aware wake-up message using a quick Haiku call.
- * @param {string|null} channelId - Optional channel ID to include conversation buffer
- */
 async function generateWakeUpMessage(channelId = null) {
   try {
     const context = gatherWakeUpContext();
@@ -329,7 +181,6 @@ async function generateWakeUpMessage(channelId = null) {
       contextBlock += `\n\nRECENT ACTIVITY (tail of today's log):\n${context.recentActivity}`;
     }
 
-    // Include conversation buffer if available
     if (channelId) {
       const conversationContext = getConversationBuffer(channelId);
       if (conversationContext && conversationContext.length > 0) {
@@ -365,10 +216,6 @@ Just output the message, nothing else. No quotes, no preamble.`;
   }
 }
 
-/**
- * Generate a quick acknowledgement message before a long operation (v1.7).
- * Only used when model is Sonnet or Opus (Haiku responds fast enough to skip ack).
- */
 async function generateAckMessage(userMessage) {
   try {
     const text = await haikuQuickCall(
@@ -394,8 +241,8 @@ Just output the ack message or SKIP, nothing else. No quotes, no preamble.`,
   }
 }
 
-// --- Image attachment cleanup helper (v2.0) ---
-function cleanupSentImages(filePaths) {
+// --- Attachment cleanup helper ---
+function cleanupSentFiles(filePaths) {
   for (const fp of filePaths) {
     try {
       if (fs.existsSync(fp)) fs.unlinkSync(fp);
@@ -406,28 +253,16 @@ function cleanupSentImages(filePaths) {
 }
 
 // --- Attachment Processing (v1.15) ---
-// Text file extensions we'll read and inject
 const TEXT_EXTENSIONS = ['.txt', '.md', '.js', '.ts', '.json', '.csv', '.py', '.html', '.css', '.xml', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.log', '.sh', '.bat', '.ps1', '.env.example'];
-const MAX_TEXT_ATTACHMENT_SIZE = 50000; // 50KB max per text file (to avoid blowing up context)
+const MAX_TEXT_ATTACHMENT_SIZE = 50000;
 
-/**
- * Check if a Discord attachment is a text file we can read.
- */
 function isTextAttachment(attachment) {
   const ext = path.extname(attachment.name || '').toLowerCase();
   if (TEXT_EXTENSIONS.includes(ext)) return true;
-  // Also check content type for text/*
   if (attachment.contentType && attachment.contentType.startsWith('text/')) return true;
   return false;
 }
 
-/**
- * Process all attachments on a Discord message.
- * Returns a string to prepend to the message content with attachment info.
- * - Text files: fetched and content injected
- * - Images: described via Gemini Vision (if enabled)
- * - Other files: noted by name/type
- */
 async function processAttachments(message) {
   if (!message.attachments || message.attachments.size === 0) return '';
 
@@ -435,7 +270,6 @@ async function processAttachments(message) {
 
   for (const [, attachment] of message.attachments) {
     try {
-      // --- Image attachments → Gemini Vision ---
       if (isGeminiEnabled() && isImageAttachment(attachment)) {
         const mimeType = getImageMimeType(attachment);
         console.log(`[Attachments] Processing image: ${attachment.name} (${mimeType})`);
@@ -448,7 +282,6 @@ async function processAttachments(message) {
         continue;
       }
 
-      // --- Text attachments → fetch and inject content ---
       if (isTextAttachment(attachment)) {
         if (attachment.size > MAX_TEXT_ATTACHMENT_SIZE) {
           parts.push(`[File: ${attachment.name} — too large to read (${(attachment.size / 1024).toFixed(1)}KB, max ${MAX_TEXT_ATTACHMENT_SIZE / 1000}KB)]`);
@@ -466,7 +299,6 @@ async function processAttachments(message) {
         continue;
       }
 
-      // --- Other attachments → just note them ---
       parts.push(`[Attachment: ${attachment.name} (${attachment.contentType || 'unknown type'}, ${(attachment.size / 1024).toFixed(1)}KB)]`);
 
     } catch (err) {
@@ -478,10 +310,6 @@ async function processAttachments(message) {
   if (parts.length === 0) return '';
   return '\n\n--- Attached Content ---\n' + parts.join('\n\n') + '\n--- End Attached Content ---\n\n';
 }
-
-// Lazy import for image extraction (only if gemini is available)
-let extractPendingImages;
-let AttachmentBuilder;
 
 export function startDiscord() {
   if (!process.env.DISCORD_TOKEN) {
@@ -496,29 +324,40 @@ export function startDiscord() {
     process.exit(1);
   }
 
-  // v2.0: Log Gemini status on startup
   if (isGeminiEnabled()) {
     console.log('[Discord] Gemini enabled (Vision + Image Generation) (v1.10)');
   } else {
     console.log('[Discord] Gemini disabled — no GEMINI_API_KEY in .env');
   }
 
+  console.log('[Discord] Gemma routing enabled — defaults to local E4B, auto-upgrades to Claude when needed (v1.18)');
+
   client.on('ready', async () => {
     console.log(`[Discord] Logged in as ${client.user.tag}`);
     console.log(`[Discord] Owner ID: ${process.env.DISCORD_OWNER_ID}`);
     console.log(`[Discord] Listening for messages...`);
 
-    // v1.9: Write heartbeat IMMEDIATELY
     writeHeartbeat();
     console.log('[Discord] Heartbeat written');
 
-    // v1.14: Seed conversation buffer from today's daily log BEFORE wake message
     const wakeChannelId = process.env.WAKE_CHANNEL_ID;
     if (wakeChannelId) {
       seedBufferFromDailyLog(wakeChannelId);
     }
 
-    // Send a context-aware wake-up message
+    // Initialize voice-chat skill
+    try {
+      const voiceChatPath = path.resolve('skills/voice-chat/handler.js');
+      const voiceChat = await import(`file:///${voiceChatPath.replace(/\\/g, '/')}`);
+      if (voiceChat.init) {
+        voiceChat.init(client);
+        console.log('[Discord] Voice chat skill initialized');
+      }
+    } catch (err) {
+      console.error('[Discord] Failed to initialize voice chat:', err.message);
+    }
+
+    // Send wake-up message
     if (wakeChannelId) {
       try {
         const channel = await client.channels.fetch(wakeChannelId);
@@ -534,47 +373,43 @@ export function startDiscord() {
   });
 
   client.on('messageCreate', async (message) => {
-    // Ignore bots and non-owner messages
     if (message.author.bot) return;
     if (message.author.id !== process.env.DISCORD_OWNER_ID) return;
 
-    // Update heartbeat on every message
     writeHeartbeat();
 
     const content = message.content.trim();
     const hasAttachments = message.attachments && message.attachments.size > 0;
 
-    // Skip if no content AND no attachments
     if (!content && !hasAttachments) return;
 
-    // --- Command handling (only if there's text content) ---
+    // --- Command handling ---
     if (content) {
-      // Quick model switch commands (v1.13)
-      if (content === '!haiku') {
-        setModel(MODELS.haiku);
-        await message.reply('Switched to **Haiku** ⚡ (fast & cheap chat mode — no tools)');
+      // Model switch commands (v1.18 — Gemma + Claude)
+      if (content === '!gemma' || content === '!e4b') {
+        const reply = forceGemmaE4B(message.channel.id);
+        await message.reply(reply);
+        return;
+      }
+      if (content === '!31b') {
+        const reply = forceGemma31B(message.channel.id);
+        await message.reply(reply);
         return;
       }
       if (content === '!sonnet') {
-        setModel(MODELS.sonnet);
-        await message.reply('Switched to **Sonnet** 🎵 (balanced, tool-capable)');
+        const reply = forceSonnet(message.channel.id);
+        await message.reply(reply);
         return;
       }
       if (content === '!opus') {
-        setModel(MODELS.opus);
-        await message.reply('Switched to **Opus** 🔥 (full power, build mode)');
+        const reply = forceOpus(message.channel.id);
+        await message.reply(reply);
         return;
       }
 
-      if (content.startsWith('!model')) {
-        const parts = content.split(/\s+/);
-        if (parts.length === 1) {
-          await message.reply(`Current model: \`${getModel()}\``);
-        } else {
-          const newModel = parts[1];
-          setModel(newModel);
-          await message.reply(`Model set to: \`${newModel}\``);
-        }
+      if (content === '!model') {
+        const status = getModelStatus(message.channel.id);
+        await message.reply(status);
         return;
       }
 
@@ -603,136 +438,99 @@ export function startDiscord() {
       }
 
       if (content === '!help') {
-        const helpText = `**MiniClaw Commands**
+        const helpText = `**MiniClaw Commands (Gemma Edition)**
 
-**Quick Model Switch:**
-\`!haiku\` — Fast & cheap chat mode (no tools)
-\`!sonnet\` — Balanced mode with tools
-\`!opus\` — Full power build mode
-
-**Model Management:**
-\`!model\` — Show current model
-\`!model <model-id>\` — Switch to a specific model ID
+**Model Switching:**
+\`!gemma\` or \`!e4b\` — Gemma E4B (fast local model, no API costs)
+\`!31b\` — Gemma 31B (high-quality local model, no API costs)
+\`!sonnet\` — Claude Sonnet (balanced, tool-capable)
+\`!opus\` — Claude Opus (full power, build mode)
 
 **System:**
+\`!model\` — Show current model
 \`!ping\` — Check bot latency
 \`!reindex\` — Rebuild memory search index
 \`!clear\` — Clear conversation history for this channel
 \`!help\` — Show this help message
 
-**Auto-routing:** Messages are automatically routed to the right model tier based on content. Build requests → Opus, tool-needing tasks → Sonnet, casual chat → Haiku.`;
+**Auto-routing:** Messages default to Gemma E4B (free local inference). The bot auto-upgrades to Gemma 31B for code generation, Claude Sonnet for tool orchestration, and Claude Opus for building/development work.`;
 
         await message.reply(helpText);
         return;
       }
     }
 
-    // --- Auto Model Switching (v1.13: three-tier) ---
-    const switchResult = content ? autoSwitchModel(content) : null;
-    let switchNotice = '';
-    if (switchResult) {
-      switchNotice = `⚡ *Auto-switched to ${switchResult}*\n\n`;
-    }
-
-    // --- Task Acknowledgement (v1.7) ---
-    // Only send ack for Sonnet/Opus — Haiku is fast enough to skip it
-    const currentModel = getModel();
-    const isHaiku = currentModel === MODELS.haiku || currentModel.includes('haiku');
+    // --- Task Acknowledgement (only for complex tasks) ---
     let ackMessage = null;
-
-    if (!isHaiku && content) {
+    if (content) {
       const ackPromise = generateAckMessage(content);
       await message.channel.sendTyping();
       ackMessage = await ackPromise;
       if (ackMessage) {
-        const ackText = switchNotice ? switchNotice + ackMessage : ackMessage;
-        await message.channel.send(ackText);
-        switchNotice = '';
+        await message.channel.send(ackMessage);
         console.log(`[Discord] Ack sent: "${ackMessage}"`);
       }
     }
 
-    // Send typing indicator (always, even for Haiku)
-    if (isHaiku || !ackMessage) {
+    if (!ackMessage) {
       await message.channel.sendTyping();
     }
 
-    // --- Process Attachments (v1.15) ---
+    // --- Process Attachments ---
     let attachmentContent = '';
     if (hasAttachments) {
       attachmentContent = await processAttachments(message);
     }
 
-    // Build the full message content: user text + attachment content
     const fullMessageContent = (content || '') + attachmentContent;
 
-    // Add user message to conversation buffer
     addToConversationBuffer(message.channel.id, 'user', content || '[attachment]');
 
     try {
-      // Get conversation context for this channel
       const conversationContext = getConversationBuffer(message.channel.id);
 
-      // Get response from Claude (with conversation context)
+      // Route through Gemma router (auto-upgrades to Claude when needed)
       const response = await chat(message.channel.id, fullMessageContent, conversationContext);
 
-      // v1.13: Log assistant response to daily log (ADDED)
       if (response && response.trim().length > 0) {
         await appendDailyLog(`Assistant: ${response.slice(0, 200)}${response.length > 200 ? '...' : ''}`);
       }
 
-      // v1.13: Check if build is complete — auto-reset to Haiku
-      checkBuildComplete(response || '');
-
-      // Add assistant response to conversation buffer
       if (response && response.trim().length > 0) {
         addToConversationBuffer(message.channel.id, 'assistant', response);
       }
 
-      // v2.0: Check for generated images to attach
-      let attachments = [];
-      try {
-        if (!extractPendingImages) {
-          const gemini = await import('./gemini.js');
-          extractPendingImages = gemini.extractPendingImages || (() => []);
-          const djs = await import('discord.js');
-          AttachmentBuilder = djs.AttachmentBuilder;
-        }
-        const pendingImages = extractPendingImages();
-        attachments = pendingImages.map(fp => {
-          const filename = path.basename(fp);
-          return new AttachmentBuilder(fp, { name: filename });
-        });
-      } catch (e) {
-        // Gemini not available, no images
+      // Drain pending attachments
+      const pendingFiles = drainPendingAttachments();
+      const attachments = pendingFiles
+        .filter(fp => fs.existsSync(fp))
+        .map(fp => new AttachmentBuilder(fp, { name: path.basename(fp) }));
+
+      if (attachments.length > 0) {
+        console.log(`[Discord] Attaching ${attachments.length} file(s): ${pendingFiles.map(fp => path.basename(fp)).join(', ')}`);
       }
 
-      // Don't send empty messages
       if ((!response || response.trim().length === 0) && attachments.length === 0) {
-        const reply = switchNotice
-          ? switchNotice + '*(completed — no text response)*'
-          : '*(completed — no text response)*';
-        await message.reply(reply);
+        await message.reply('*(completed — no text response)*');
         return;
       }
 
-      // Split long responses (Discord 2000 char limit)
+      // Split long responses
       const maxLen = 1900;
-      const fullResponse = switchNotice
-        ? switchNotice + response
-        : response;
 
-      if (fullResponse.length <= maxLen && attachments.length === 0) {
-        await message.reply(fullResponse);
-      } else if (fullResponse.length <= maxLen) {
-        await message.reply({ content: fullResponse, files: attachments });
-        cleanupSentImages(attachments.map(a => a.attachment || ''));
+      if (response.length <= maxLen && attachments.length === 0) {
+        await message.reply(response);
+      } else if (response.length <= maxLen) {
+        await message.reply({ content: response, files: attachments });
+        const tempFiles = pendingFiles.filter(fp => fp.includes('temp'));
+        cleanupSentFiles(tempFiles);
       } else {
-        const chunks = splitMessage(fullResponse, maxLen);
+        const chunks = splitMessage(response, maxLen);
         for (let i = 0; i < chunks.length; i++) {
           if (i === 0 && attachments.length > 0) {
             await message.reply({ content: chunks[i], files: attachments });
-            cleanupSentImages(attachments.map(a => a.attachment || ''));
+            const tempFiles = pendingFiles.filter(fp => fp.includes('temp'));
+            cleanupSentFiles(tempFiles);
           } else if (i === 0) {
             await message.reply(chunks[i]);
           } else {
@@ -742,10 +540,7 @@ export function startDiscord() {
       }
     } catch (err) {
       console.error('[Discord] Error:', err);
-      const errorMsg = switchNotice
-        ? switchNotice + `Error: ${err.message}`
-        : `Error: ${err.message}`;
-      await message.reply(errorMsg);
+      await message.reply(`Error: ${err.message}`);
     }
   });
 
@@ -776,3 +571,5 @@ function splitMessage(text, maxLength) {
 
   return chunks;
 }
+
+export { client };

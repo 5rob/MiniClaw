@@ -2,6 +2,7 @@
 // Tool registry — loads built-in tools + custom skills
 // v1.10: Added generate_image tool (Gemini image generation)
 // v1.13: Fixed duplicate tool name bug — final dedup + concurrency guard
+// v1.17: Pending attachments queue for image gen + browser screenshots
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
@@ -10,6 +11,7 @@ import * as calendar from './calendar.js';
 import * as codeBuilder from './code-builder.js';
 import { setModel, getModel } from './claude.js';
 import { generateImage, cleanupTempFiles, isGeminiEnabled } from './gemini.js';
+import { addPendingAttachment } from './pending-attachments.js';
 
 const SKILLS_DIR = path.resolve('skills');
 let config = null;
@@ -279,6 +281,12 @@ async function executeBuiltIn(name, input) {
       }
       const result = await generateImage(input.prompt, input.aspectRatio || '1:1');
 
+      // If image was generated successfully, queue it for Discord attachment
+      if (result.filePath) {
+        addPendingAttachment(result.filePath);
+        console.log(`[Tools] Queued image for Discord attachment: ${result.filePath}`);
+      }
+
       // Schedule cleanup of old temp files (non-blocking)
       setTimeout(() => cleanupTempFiles(), 5000);
 
@@ -404,7 +412,15 @@ export async function executeTool(name, input) {
 
   // Try custom skill
   if (cachedCustomHandlers[name]) {
-    return await cachedCustomHandlers[name](input);
+    const result = await cachedCustomHandlers[name](input);
+
+    // Check if the custom skill returned a file to attach (screenshot, PDF, etc.)
+    if (result && result.success && result.file && fs.existsSync(result.file)) {
+      addPendingAttachment(result.file);
+      console.log(`[Tools] Queued skill attachment for Discord: ${result.file}`);
+    }
+
+    return result;
   }
 
   throw new Error(`Unknown tool: ${name}`);

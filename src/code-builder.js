@@ -1,6 +1,7 @@
 // src/code-builder.js
 // Replaces skill-builder.js — handles both project management AND Claude Code builds
 // v2.0 — Merged skill_builder actions + Claude Code delegation
+// v2.1 — Added build summary injection to staging memory
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -10,6 +11,7 @@ const SKILLS_DIR = path.resolve('skills');
 const STAGING_DIR = path.join(PROJECT_ROOT, 'staging');
 const STAGING_SKILLS_DIR = path.join(STAGING_DIR, 'skills');
 const BUILD_LOG_DIR = path.join(STAGING_DIR, 'logs', 'builds');
+const STAGING_MEMORY_DIR = path.join(STAGING_DIR, 'memory', 'daily');
 const IS_STAGING = process.env.BOT_ROLE === 'staging';
 
 fs.mkdirSync(SKILLS_DIR, { recursive: true });
@@ -29,6 +31,39 @@ function timestamp() {
 
 function isoTimestamp() {
   return new Date().toISOString();
+}
+
+function getTodayDateString() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function appendToStagingMemory(entry) {
+  try {
+    ensureDir(STAGING_MEMORY_DIR);
+    const dateStr = getTodayDateString();
+    const logPath = path.join(STAGING_MEMORY_DIR, `${dateStr}.md`);
+    
+    // Create file with header if it doesn't exist
+    if (!fs.existsSync(logPath)) {
+      fs.writeFileSync(logPath, `# Daily Log — ${dateStr}\n\n`);
+    }
+    
+    const timeStr = new Date().toLocaleTimeString('en-AU', { 
+      timeZone: 'Australia/Sydney',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true 
+    }).toLowerCase();
+    
+    fs.appendFileSync(logPath, `**${timeStr}** — ${entry}\n\n`);
+    console.log(`[CodeBuilder] Wrote to staging memory: ${logPath}`);
+  } catch (err) {
+    console.error(`[CodeBuilder] Failed to write to staging memory:`, err.message);
+  }
 }
 
 // ============================================================
@@ -464,6 +499,12 @@ function build(input) {
             handlerValid = handlerContent.includes('toolDefinition') && handlerContent.includes('execute');
           } catch (e) { /* can't read */ }
         }
+
+        // INJECT BUILD SUMMARY TO STAGING MEMORY (v2.1)
+        const status = code === 0 && handlerValid ? 'SUCCESS ✅' : 'FAILED ❌';
+        const memoryEntry = `Claude Code build completed for **${skillName}** skill. Status: ${status}. Duration: ${elapsed}s${costInfo ? `, cost: ${costInfo}` : ''}. Files created: ${handlerExists ? 'handler.js' : 'none'}${skillMdExists ? ', SKILL.md' : ''}. ${code === 0 && handlerValid ? 'Skill is ready to test — restart staging to load it.' : 'Build had issues — check logs or use read_project to review.'}`;
+        
+        appendToStagingMemory(memoryEntry);
 
         resolve({
           success: code === 0 && handlerExists && handlerValid,

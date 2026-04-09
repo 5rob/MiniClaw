@@ -26,6 +26,7 @@
     "better-sqlite3": "^11.7.0",
     "discord.js": "^14.17.0",
     "dotenv": "^16.4.7",
-    "googleapis": "^144.0.0"
+    "googleapis": "^144.0.0",
+    "puppeteer": "^24.40.0"
   }
 }
