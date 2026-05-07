@@ -445,36 +445,64 @@ just a liveness ping; there's no real evolution loop. Hermes has a built-in
   4. Append `daily_summary` to a new file `memory/summaries/YYYY-MM-DD.md`
      (so the daily log itself can eventually be deleted/archived without
      loss).
-  5. Stash all `*_proposals` into `memory/proposals/<date>.md` and DM them
-     to Rob's Discord with reaction-based approval (👍 to apply, 👎 to
-     discard, 🤔 to defer).
-  6. On 👍, apply the proposed diff to the target file. **Always commit to
-     git first** so the change is reversible.
+  5. Auto-apply the proposed diffs on the schedule below. Each application
+     is a separate git commit so any single night can be reverted in isolation.
+  6. After applying, post a digest to Rob's Discord: a short summary of what
+     changed in SOUL / IDENTITY / USER / MEMORY last night, with the commit
+     SHAs. No approval gate — this is FYI so Rob can steer if he ever wants
+     to revert (`git revert <sha>`).
 
-**Critical safeguards**
+**Auto-apply cadence**
 
-- **Never auto-edit SOUL.md, IDENTITY.md, or USER.md.** Persona files
-  require human-in-the-loop. The whole point is to let the bot grow without
-  drifting into something Rob doesn't recognise.
-- **Always `git add SOUL.md IDENTITY.md USER.md && git commit` before
-  applying.** If Rob hates the change a week later, `git diff` is the
-  receipt.
-- **Cap proposal frequency.** No more than 1 SOUL edit per week, 1 IDENTITY
-  edit per month. The reflection prompt enforces "be conservative" but back
-  it with code.
+- **MEMORY.md consolidations:** every night. Additive, low-risk.
+- **USER.md:** every night. Fact-based; co-evolves with MEMORY.md.
+- **SOUL.md:** every night. The bot is allowed to evolve its own voice
+  daily. The reflection prompt still says "be conservative" — most nights
+  there should be no edit — but if the model proposes one, it ships.
+- **IDENTITY.md:** every third night (gate by checking file mtime: only
+  apply if the last identity commit is >72h old). Identity moves slower
+  than soul on purpose — name / creature / vibe / emoji shouldn't churn.
+
+**Safeguards (still in force)**
+
+- **Always `git add <file> && git commit` before the next reflection
+  cycle.** One commit per file per night, with the model's rationale as
+  the commit message. Reversibility is the whole safety net — `git revert
+  <sha>` undoes any single night cleanly.
+- **Tag a baseline before Phase 6 goes live:**
+  `git tag persona-baseline-pre-reflection`. If drift gets weird in three
+  months, this is the known-good rollback target.
 - **Log every applied change to `memory/persona-drift.md`** with timestamp,
-  diff, and Rob's approval reaction. This is the audit trail.
+  diff summary, and the rationale the model gave. Git is the canonical
+  audit trail; this file is the human-readable one Rob actually reads.
+- **The reflection prompt continues to say "be conservative."** Nightly
+  *permission* to edit ≠ nightly *requirement*. Empty proposals are normal
+  and expected on most days.
+- **Skip the cycle entirely if today's daily log is empty.** If Rob didn't
+  talk to the bot, there's nothing real to reflect on — don't let the
+  model invent changes out of nothing.
 
 **Acceptance**
 - Cron job fires at 03:30 next morning. Output appears in
-  `memory/summaries/` and `memory/proposals/`.
-- Rob receives a Discord DM with proposals (or "no changes proposed today").
-- Reactions trigger the right behaviour. 👎 leaves files untouched. 👍 produces
-  a git commit on SOUL.md / etc.
-- After 1 week: `git log SOUL.md` shows 0–1 commits, all with rationale.
-- After 1 month: re-run the persona preservation test. Voice should still
-  match the baseline. If it has drifted noticeably, the cron is too liberal
-  — tighten the "be conservative" rule and reduce proposal cadence.
+  `memory/summaries/` and `memory/persona-drift.md`.
+- Rob receives a Discord digest: "Last night I updated SOUL.md (commit
+  abc123): <one-line summary>. No changes to IDENTITY/USER. Consolidated 3
+  facts into MEMORY.md." — or "No changes last night" on quiet days.
+- Each applied change is a clean git commit on a single file with the
+  rationale as the commit message. `git revert <sha>` undoes one night
+  without touching others.
+- After 1 week: `git log --oneline SOUL.md` shows up to 7 commits (likely
+  fewer — most nights should be empty). `git log IDENTITY.md` shows 0–2.
+  `git log USER.md` shows steady additions. None of them show duplicate /
+  oscillating edits (model adding then removing the same line).
+- After 1 month: re-run the persona preservation test. The bot should still
+  feel like the same friend — same directness, same opinions, same humour
+  — even if specific phrasing has shifted. If it instead feels like a
+  different bot wearing the old name, that's runaway drift: revert to
+  `persona-baseline-pre-reflection`, tighten the reflection prompt's
+  "be conservative" framing, and try again.
+- The audit log `memory/persona-drift.md` is readable, scannable, and
+  matches `git log` 1:1.
 
 ---
 
@@ -501,12 +529,20 @@ These should be resolved before or during implementation, not after.
    tool-call retry logic handles some of this; budget for some Phase 4
    manual-fallback to Claude on tool-heavy tasks.
 
-2. **Voice drift.** Local models have different "default voices" baked in
-   from training. Even with SOUL.md, Qwen's output will *feel* slightly
-   different from Claude's. The persona preservation test in Section 1 is
-   your check. If the gap is too large, raise temperature to ~1.0 (per
-   DeepSeek/Qwen defaults), shorten SOUL.md to its sharpest 5–6 lines, or
-   accept a slight voice change as the cost of going local.
+2. **Voice drift — two flavours, only one is bad.**
+   - *Model drift* (Phase 3 risk): Local models have different "default
+     voices" baked in from training. Even with SOUL.md, Qwen will *feel*
+     slightly different from Claude. The Section 1 persona preservation
+     test is the check. If the gap is too large at Phase 3, raise
+     temperature to ~1.0, shorten SOUL.md to its sharpest 5–6 lines, or
+     accept the shift as the cost of going local.
+   - *Reflection drift* (Phase 6 risk): With nightly auto-edits to SOUL.md,
+     some drift is the *goal* — that's what "self-improvement" means here.
+     The failure mode is *runaway* drift: the bot in two months feels like
+     someone else. Mitigations are the `persona-baseline-pre-reflection`
+     git tag, the conservative reflection prompt, the empty-log skip, and
+     re-running the preservation test monthly. If it ever fails, revert to
+     the tag and tune.
 
 3. **64K context vs MiniClaw's 200K.** Hermes' minimum is 64K; Qwen at 65K
    is a hard ceiling for affordability. MiniClaw currently runs Sonnet at
